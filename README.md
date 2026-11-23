@@ -20,3 +20,4 @@ Agent Fleet in action: every agent in sync, sharing context on the same task.
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — 环境冻结:PostgreSQL 18.7, Valkey 9.1.2.
 - [prototype/](prototype/) — 阶段 0 原型:FastAPI + SQLite + 进程内消息总线,见 [prototype/README.md](prototype/README.md).
 - [fleet-kit/](fleet-kit/) — **Fleet Kit 1.0** 可 fork 协作包（Hub + MCP 门面 + `./demo.sh`），见 [fleet-kit/README.md](fleet-kit/README.md).
+- [fleet-kit-docs/](fleet-kit-docs/) — Fleet Kit 1.0 **工作原理详解**（架构、消息流、身份、MCP、验收），见 [fleet-kit-docs/README.md](fleet-kit-docs/README.md).
