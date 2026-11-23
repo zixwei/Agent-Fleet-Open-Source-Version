@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.demo-*.db
+.demo-fleet.db
+.demo-hub.log
+.demo-out.txt
+*.db
+.pytest_cache/
