@@ -82,3 +82,11 @@ def require_agent_auth(x_api_key: str | None = Header(default=None)):
     if auth.get("agent_id") is None:
         raise HTTPException(status_code=401, detail="agent credential required")
     return auth
+
+
+def require_tenant_auth(x_api_key: str | None = Header(default=None)):
+    """Tenant/admin key only. Agent keys cannot approve/suspend/register."""
+    auth = require_api_key(x_api_key)
+    if auth.get("agent_id") is not None:
+        raise HTTPException(status_code=403, detail="tenant admin credential required")
+    return auth

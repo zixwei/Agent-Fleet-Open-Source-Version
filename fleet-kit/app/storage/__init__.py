@@ -13,6 +13,7 @@ from app import config
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
     agent_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'default',
     name TEXT NOT NULL,
     endpoint TEXT NOT NULL,
     capabilities TEXT NOT NULL DEFAULT '[]',
@@ -72,38 +73,91 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # Migrate older 6-column agents tables (no tenant_id).
+        cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(agents)").fetchall()
+        }
+        if "tenant_id" not in cols:
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
+            )
         conn.commit()
 
 
-def insert_agent(agent_id, name, endpoint, capabilities, status, created_at):
+def insert_agent(agent_id, tenant_id, name, endpoint, capabilities, status, created_at):
     with connect() as conn:
         conn.execute(
-            "INSERT INTO agents VALUES (?,?,?,?,?,?)",
-            (agent_id, name, endpoint, json.dumps(capabilities), status, created_at),
+            "INSERT INTO agents (agent_id, tenant_id, name, endpoint, capabilities, status, created_at) VALUES (?,?,?,?,?,?,?)",
+            (agent_id, tenant_id, name, endpoint, json.dumps(capabilities), status, created_at),
         )
         conn.commit()
 
 
-def get_agent(agent_id):
+def get_agent(agent_id, tenant_id=None):
     with connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
-        ).fetchone()
+        if tenant_id is None:
+            row = conn.execute(
+                "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM agents WHERE agent_id = ? AND tenant_id = ?",
+                (agent_id, tenant_id),
+            ).fetchone()
     return dict(row) if row else None
 
 
-def list_agents():
+def list_agents(tenant_id=None):
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM agents ORDER BY created_at").fetchall()
+        if tenant_id is None:
+            rows = conn.execute("SELECT * FROM agents ORDER BY created_at").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM agents WHERE tenant_id = ? ORDER BY created_at",
+                (tenant_id,),
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
-def set_agent_status(agent_id, status):
+def set_agent_status(agent_id, status, tenant_id=None):
     with connect() as conn:
-        conn.execute(
-            "UPDATE agents SET status = ? WHERE agent_id = ?", (status, agent_id)
+        if tenant_id is None:
+            cur = conn.execute(
+                "UPDATE agents SET status = ? WHERE agent_id = ?", (status, agent_id)
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE agents SET status = ? WHERE agent_id = ? AND tenant_id = ?",
+                (status, agent_id, tenant_id),
+            )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def set_task_status_atomic(task_id, from_status, to_status, updated_at):
+    """CAS status update. Returns True if a row moved."""
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+            (to_status, updated_at, task_id, from_status),
         )
         conn.commit()
+        return cur.rowcount > 0
+
+
+def list_audit_from_seq(after_seq=0, limit=1000):
+    """Oldest-first window for chain verification."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+            (after_seq, limit),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail"])
+        out.append(d)
+    return out
 
 
 def insert_task(task_id, tenant_id, agent_id, title, status, created_at, updated_at):

@@ -30,9 +30,16 @@ def build_envelope(
     correlation_id: str | None = None,
     protocol: str = "fleet",
     protocol_version: str = "1.0",
+    client_idempotency_key: str | None = None,
 ) -> dict:
     message_id = str(uuid.uuid4())
     event_id = str(uuid.uuid4())
+    if client_idempotency_key:
+        idem = f"{tenant_id}:{sender_agent_id}:{task_id}:{event_type}:{client_idempotency_key}"
+    else:
+        idem = ":".join(
+            [tenant_id, sender_agent_id, task_id, event_type, message_id]
+        )
     return {
         "message_id": message_id,
         "event_id": event_id,
@@ -47,9 +54,7 @@ def build_envelope(
         "event_type": event_type,
         "created_at": now_iso(),
         "correlation_id": correlation_id or message_id,
-        "idempotency_key": ":".join(
-            [tenant_id, sender_agent_id, task_id, event_type, message_id]
-        ),
+        "idempotency_key": idem,
         "payload_reference": None,
         "trace_id": str(uuid.uuid4()),
         "signature": None,

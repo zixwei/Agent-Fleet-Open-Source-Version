@@ -28,6 +28,7 @@ class MessageBus:
         task_id: str,
         event_type: str,
         payload: dict,
+        client_idempotency_key: str | None = None,
     ) -> dict:
         envelope = build_envelope(
             tenant_id=tenant_id,
@@ -36,6 +37,7 @@ class MessageBus:
             task_id=task_id,
             event_type=event_type,
             payload=payload,
+            client_idempotency_key=client_idempotency_key,
         )
         return self.publish(envelope)
 

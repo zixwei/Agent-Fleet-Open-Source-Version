@@ -9,8 +9,11 @@ export FLEET_API_KEY="${FLEET_API_KEY:-fleet-demo-tenant}"
 export FLEET_OTHER_TENANT_KEY="${FLEET_OTHER_TENANT_KEY:-fleet-demo-other}"
 export FLEET_AGENT_A_KEY="${FLEET_AGENT_A_KEY:-fleet-demo-orch}"
 export FLEET_AGENT_B_KEY="${FLEET_AGENT_B_KEY:-fleet-demo-worker}"
-export FLEET_HUB_URL="${FLEET_HUB_URL:-http://127.0.0.1:8765}"
 PORT="${FLEET_PORT:-8765}"
+# Keep URL in sync with the listening port unless the caller set both.
+if [[ -z "${FLEET_HUB_URL:-}" ]]; then
+  export FLEET_HUB_URL="http://127.0.0.1:${PORT}"
+fi
 DB_PATH="${ROOT}/.demo-fleet.db"
 rm -f "$DB_PATH"
 

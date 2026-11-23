@@ -19,7 +19,7 @@ VALID_TRANSITIONS = {
 
 
 def create_task(tenant_id: str, agent_id: str, title: str) -> dict:
-    agent = db.get_agent(agent_id)
+    agent = db.get_agent(agent_id, tenant_id=tenant_id)
     if not agent:
         raise ValueError(f"agent {agent_id} not found")
     if agent["status"] != "Active":
@@ -42,7 +42,10 @@ def set_status(task_id: str, status: str) -> dict:
     task = db.get_task(task_id)
     if not task:
         raise ValueError(f"task {task_id} not found")
-    if status not in VALID_TRANSITIONS.get(task["status"], set()):
-        raise ValueError(f"cannot move task {task_id} from {task['status']} to {status}")
-    db.set_task_status(task_id, status, now_iso())
+    current = task["status"]
+    if status not in VALID_TRANSITIONS.get(current, set()):
+        raise ValueError(f"cannot move task {task_id} from {current} to {status}")
+    # Atomic CAS: concurrent transitions cannot both succeed from the same state.
+    if not db.set_task_status_atomic(task_id, current, status, now_iso()):
+        raise ValueError(f"cannot move task {task_id} from {current} to {status}")
     return get_task(task_id)

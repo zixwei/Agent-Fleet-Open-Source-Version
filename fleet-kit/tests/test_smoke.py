@@ -77,3 +77,74 @@ def test_core_flow_protocol_fleet():
 def test_auth_required():
     client = TestClient(app)
     assert client.get("/agents").status_code == 401
+
+
+def test_tenant_cannot_suspend_foreign_agent(tmp_path, monkeypatch):
+    import json
+
+    db_path = tmp_path / "tenants.db"
+    monkeypatch.setenv("AI_FLEET_DB", f"sqlite:///{db_path}")
+    monkeypatch.setenv(
+        "AI_FLEET_TENANT_API_KEYS",
+        json.dumps({"key-a": "tenant-a", "key-b": "tenant-b"}),
+    )
+    import app.config as config
+
+    config.DATABASE_PATH = str(db_path)
+    from app import storage as db
+
+    db.init_db()
+    client = TestClient(app)
+    ha = {"X-API-Key": "key-a"}
+    hb = {"X-API-Key": "key-b"}
+    assert (
+        client.post(
+            "/agents",
+            json={
+                "agent_id": "agent-a",
+                "name": "A",
+                "endpoint": "http://a",
+                "capabilities": [],
+            },
+            headers=ha,
+        ).status_code
+        == 200
+    )
+    assert client.post("/agents/agent-a/approve", headers=ha).status_code == 200
+    # Tenant B cannot suspend A's agent
+    assert client.post("/agents/agent-a/suspend", headers=hb).status_code == 404
+    # Agent key cannot suspend either
+    monkeypatch.setenv(
+        "AI_FLEET_AGENT_API_KEYS",
+        json.dumps({"agent-key": {"agent_id": "agent-a", "tenant_id": "tenant-a"}}),
+    )
+    assert client.post("/agents/agent-a/suspend", headers={"X-API-Key": "agent-key"}).status_code == 403
+
+
+def test_client_idempotency_key_retry():
+    client = TestClient(app)
+    client.post(
+        "/agents",
+        json={
+            "agent_id": "agent-a",
+            "name": "Agent A",
+            "endpoint": "http://a.local",
+            "capabilities": [],
+        },
+        headers=HEADERS,
+    )
+    client.post("/agents/agent-a/approve", headers=HEADERS)
+    task_id = client.post(
+        "/tasks", json={"agent_id": "agent-a", "title": "idem"}, headers=HEADERS
+    ).json()["task_id"]
+    body = {
+        "sender_agent_id": "agent-a",
+        "event_type": "ping",
+        "payload": {"n": 1},
+        "idempotency_key": "client-retry-1",
+    }
+    r1 = client.post(f"/tasks/{task_id}/messages", json=body, headers=HEADERS)
+    r2 = client.post(f"/tasks/{task_id}/messages", json=body, headers=HEADERS)
+    assert r1.json()["stored"] is True
+    assert r2.json()["stored"] is False
+    assert len(client.get(f"/tasks/{task_id}/messages", headers=HEADERS).json()) == 1

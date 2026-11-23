@@ -23,7 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app import config
-from app.identity import require_agent_auth, require_api_key
+from app.identity import require_agent_auth, require_api_key, require_tenant_auth
 from app import observability as audit
 from app import registry
 from app.messaging.bus import bus
@@ -51,9 +51,11 @@ class AgentIn(BaseModel):
 
 
 @app.post("/agents")
-def create_agent(body: AgentIn, auth=Depends(require_api_key)):
+def create_agent(body: AgentIn, auth=Depends(require_tenant_auth)):
     try:
-        agent = registry.register_agent(body.agent_id, body.name, body.endpoint, body.capabilities)
+        agent = registry.register_agent(
+            auth["tenant_id"], body.agent_id, body.name, body.endpoint, body.capabilities
+        )
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     audit.record(auth["tenant_id"], "agent.register", body.agent_id, {"name": body.name})
@@ -62,13 +64,13 @@ def create_agent(body: AgentIn, auth=Depends(require_api_key)):
 
 @app.get("/agents")
 def list_agents(auth=Depends(require_api_key)):
-    return registry.list_agents()
+    return registry.list_agents(tenant_id=auth["tenant_id"])
 
 
 @app.post("/agents/{agent_id}/approve")
-def approve_agent(agent_id: str, auth=Depends(require_api_key)):
+def approve_agent(agent_id: str, auth=Depends(require_tenant_auth)):
     try:
-        agent = registry.approve_agent(agent_id)
+        agent = registry.approve_agent(auth["tenant_id"], agent_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     audit.record(auth["tenant_id"], "agent.approve", agent_id, {})
@@ -76,9 +78,9 @@ def approve_agent(agent_id: str, auth=Depends(require_api_key)):
 
 
 @app.post("/agents/{agent_id}/suspend")
-def suspend_agent(agent_id: str, auth=Depends(require_api_key)):
+def suspend_agent(agent_id: str, auth=Depends(require_tenant_auth)):
     try:
-        agent = registry.suspend_agent(agent_id)
+        agent = registry.suspend_agent(auth["tenant_id"], agent_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     audit.record(auth["tenant_id"], "agent.suspend", agent_id, {})
@@ -143,6 +145,9 @@ class MessageIn(BaseModel):
     recipient_agent_id: str | None = None
     event_type: str = Field(min_length=1)
     payload: dict = {}
+    # Stable client key for retries. When set, a timed-out retry with the
+    # same key is a no-op instead of a second message.
+    idempotency_key: str | None = None
 
 
 @app.post("/tasks/{task_id}/messages")
@@ -155,12 +160,12 @@ def send_message(task_id: str, body: MessageIn, auth=Depends(require_api_key)):
         raise HTTPException(
             status_code=403, detail="sender does not match authenticated agent"
         )
-    if not registry.get_agent(body.sender_agent_id):
+    if not registry.get_agent(body.sender_agent_id, tenant_id=auth["tenant_id"]):
         raise HTTPException(
             status_code=400, detail=f"sender agent {body.sender_agent_id} not found"
         )
     recipient_id = body.recipient_agent_id or task["agent_id"]
-    if not registry.get_agent(recipient_id):
+    if not registry.get_agent(recipient_id, tenant_id=auth["tenant_id"]):
         raise HTTPException(
             status_code=400, detail=f"recipient agent {recipient_id} not found"
         )
@@ -171,6 +176,7 @@ def send_message(task_id: str, body: MessageIn, auth=Depends(require_api_key)):
         task_id=task_id,
         event_type=body.event_type,
         payload=body.payload,
+        client_idempotency_key=body.idempotency_key,
     )
     audit.record(
         auth["tenant_id"],

@@ -54,11 +54,15 @@ def list_audit(limit: int = 100, actor: str | None = None) -> list:
 
 
 def verify_chain(limit: int = 1000) -> dict:
-    """Recompute the chain over the most recent entries. Returns ok/False
-    plus the first broken sequence, if any."""
-    entries = db.list_audit(limit=limit)
-    entries = list(reversed(entries))  # oldest first
-    prev = "GENESIS"
+    """Recompute the hash chain over a contiguous oldest-first window.
+
+    Anchors to the first entry's recorded predecessor (GENESIS or a prior
+    hash outside the window), so a truncated window does not false-fail.
+    """
+    entries = db.list_audit_from_seq(after_seq=0, limit=limit)
+    if not entries:
+        return {"ok": True, "checked": 0}
+    prev = entries[0]["prev_hash"]
     for e in entries:
         if e["prev_hash"] != prev:
             return {"ok": False, "broken_at_seq": e["seq"]}
