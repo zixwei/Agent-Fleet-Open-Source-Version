@@ -29,6 +29,8 @@ class MessageBus:
         event_type: str,
         payload: dict,
         client_idempotency_key: str | None = None,
+        trace_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> dict:
         envelope = build_envelope(
             tenant_id=tenant_id,
@@ -38,6 +40,8 @@ class MessageBus:
             event_type=event_type,
             payload=payload,
             client_idempotency_key=client_idempotency_key,
+            trace_id=trace_id,
+            correlation_id=correlation_id,
         )
         return self.publish(envelope)
 

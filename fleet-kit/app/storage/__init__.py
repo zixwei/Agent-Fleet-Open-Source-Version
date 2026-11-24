@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'submitted',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    created_by_agent_id TEXT,
+    trace_id TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     idempotency_key TEXT PRIMARY KEY,
@@ -39,7 +41,12 @@ CREATE TABLE IF NOT EXISTS messages (
     recipient_agent_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     payload TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    context_id TEXT,
+    correlation_id TEXT,
+    trace_id TEXT,
+    protocol TEXT,
+    protocol_version TEXT
 );
 CREATE TABLE IF NOT EXISTS message_receipts (
     message_id TEXT NOT NULL,
@@ -58,7 +65,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     target TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '{}'
 );
+-- Query-path indexes. Every column below exists in the oldest schema, so
+-- creating them on an existing database is safe; IF NOT EXISTS keeps
+-- init_db idempotent.
+-- GET /audit (actor = ? ORDER BY seq DESC LIMIT ?)
+CREATE INDEX IF NOT EXISTS idx_audit_actor_seq ON audit_log (actor, seq);
+-- correlate_task (actor = ? AND target = ? ORDER BY seq)
+CREATE INDEX IF NOT EXISTS idx_audit_actor_target_seq ON audit_log (actor, target, seq);
+-- list_messages (task_id = ? ORDER BY created_at), receipts by message_id
+CREATE INDEX IF NOT EXISTS idx_messages_task_created ON messages (task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages (message_id);
+-- GET /tasks (tenant_id = ? ORDER BY created_at)
+CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks (tenant_id, created_at);
 """
+
+
+# Envelope fields persisted for T09 (audit record correlation). Fixed list,
+# so the column names interpolated into ALTER TABLE are never user input.
+MESSAGE_TRACE_COLUMNS = (
+    "context_id", "correlation_id", "trace_id", "protocol", "protocol_version",
+)
 
 
 def connect() -> sqlite3.Connection:
@@ -81,6 +107,25 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
             )
+        # Migrate older tasks tables (no creator column). NULL = created
+        # with a tenant/admin credential.
+        task_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "created_by_agent_id" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN created_by_agent_id TEXT")
+        # T09: tasks carry the trace every message on them defaults to.
+        if "trace_id" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN trace_id TEXT")
+        # T09: persist the envelope's correlation fields (they used to be
+        # built and then dropped). Rows from before the migration keep
+        # NULL and are reported as unattributed, never back-filled.
+        msg_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        for col in MESSAGE_TRACE_COLUMNS:
+            if col not in msg_cols:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
         conn.commit()
 
 
@@ -145,8 +190,17 @@ def set_task_status_atomic(task_id, from_status, to_status, updated_at):
         return cur.rowcount > 0
 
 
+def audit_head():
+    """(seq, entry_hash) of the newest audit entry; (0, "GENESIS") when empty."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+    return (row["seq"], row["entry_hash"]) if row else (0, "GENESIS")
+
+
 def list_audit_from_seq(after_seq=0, limit=1000):
-    """Oldest-first window for chain verification."""
+    """Oldest-first batch of entries with seq > after_seq (chain verification)."""
     with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT ?",
@@ -160,11 +214,15 @@ def list_audit_from_seq(after_seq=0, limit=1000):
     return out
 
 
-def insert_task(task_id, tenant_id, agent_id, title, status, created_at, updated_at):
+def insert_task(
+    task_id, tenant_id, agent_id, title, status, created_at, updated_at,
+    created_by_agent_id=None, trace_id=None,
+):
     with connect() as conn:
         conn.execute(
-            "INSERT INTO tasks VALUES (?,?,?,?,?,?,?)",
-            (task_id, tenant_id, agent_id, title, status, created_at, updated_at),
+            "INSERT INTO tasks (task_id, tenant_id, agent_id, title, status, created_at, updated_at, created_by_agent_id, trace_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (task_id, tenant_id, agent_id, title, status, created_at, updated_at,
+             created_by_agent_id, trace_id),
         )
         conn.commit()
 
@@ -204,7 +262,7 @@ def insert_message(envelope):
     with connect() as conn:
         try:
             conn.execute(
-                "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO messages (idempotency_key, message_id, event_id, task_id, tenant_id, sender_agent_id, recipient_agent_id, event_type, payload, created_at, context_id, correlation_id, trace_id, protocol, protocol_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     envelope["idempotency_key"],
                     envelope["message_id"],
@@ -216,6 +274,11 @@ def insert_message(envelope):
                     envelope["event_type"],
                     json.dumps(envelope["payload"]),
                     envelope["created_at"],
+                    envelope.get("context_id"),
+                    envelope.get("correlation_id"),
+                    envelope.get("trace_id"),
+                    envelope.get("protocol"),
+                    envelope.get("protocol_version"),
                 ),
             )
             conn.commit()
@@ -352,6 +415,21 @@ def last_audit_hash():
             "SELECT entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
         ).fetchone()
     return row["entry_hash"] if row else "GENESIS"
+
+
+def list_audit_for_target(actor, target):
+    """All audit entries of one tenant (actor) about one target, oldest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE actor = ? AND target = ? ORDER BY seq ASC",
+            (actor, target),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail"])
+        out.append(d)
+    return out
 
 
 def list_audit(limit=100, actor=None):
