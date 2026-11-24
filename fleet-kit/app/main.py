@@ -1,6 +1,6 @@
 """Agent Fleet Hub - Core API (modular monolith, Stage 0 deliverable #1).
 
-Endpoints (all except /health require X-API-Key):
+Endpoints (all except /health require X-API-Key; /ops/* take the operator key):
   POST /agents              register an agent (manual registration, Pending)
   GET  /agents              list agents
   POST /agents/{id}/approve approve an agent (Pending -> Active)
@@ -16,14 +16,16 @@ Endpoints (all except /health require X-API-Key):
   GET  /tasks/{id}/messages list messages for a task (each carries its receipt, if any)
   GET  /tasks/{id}/correlation T09: messages/receipts/status vs. audit entries
   GET  /audit               append-only audit log (hash-chained)
-  GET  /audit/verify        verify the whole audit hash chain (or from a kept checkpoint)
+  GET  /audit/verify        tenant admin: is the whole audit chain intact ({"ok"} only)
+  GET  /ops/audit/verify    operator: full / incremental verification with checkpoint
+  GET  /ops/audit           operator: audit log across tenants (actor filter)
   GET  /health              health check (no auth)
 
 Run:  uvicorn app.main:app --host 127.0.0.1 --port 8000
 """
 import logging
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import http_exception_handler
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -31,7 +33,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
 from app import config
-from app.identity import require_agent_auth, require_api_key, require_tenant_auth
+from app import identity
+from app.identity import (
+    UNAUTHENTICATED_ACTOR,
+    require_agent_auth,
+    require_api_key,
+    require_operator_auth,
+    require_tenant_auth,
+)
 from app import observability as audit
 from app.observability.denials import DenialLimiter
 from app import registry
@@ -45,6 +54,11 @@ logger = logging.getLogger("agent_fleet_hub")
 
 @app.on_event("startup")
 def startup():
+    # Refuse to start on a malformed key configuration (e.g. a tenant id that
+    # collides with a reserved system actor, or a weak/reused operator key).
+    problems = identity.validate_key_config()
+    if problems:
+        raise RuntimeError("invalid key configuration: " + "; ".join(problems))
     db.init_db()
 
 
@@ -131,7 +145,7 @@ def _write_denial(request: Request, exc: HTTPException) -> None:
         actor = claimed["tenant_id"]
         who = {"kind": "refused_agent_key", "agent_id": claimed["agent_id"]}
     else:
-        actor, who = "unauthenticated", {"kind": None, "agent_id": None}
+        actor, who = UNAUTHENTICATED_ACTOR, {"kind": None, "agent_id": None}
     source = _source(request)
     write, summaries = denial_limiter.decide(
         actor=actor,
@@ -448,8 +462,14 @@ def task_correlation(task_id: str, auth=Depends(require_api_key)):
     return audit.correlate_task(auth["tenant_id"], task_id)
 
 
+AUDIT_PAGE_MAX = 1000
+
+
 @app.get("/audit")
-def list_audit(limit: int = 100, auth=Depends(require_api_key)):
+def list_audit(
+    limit: int = Query(100, ge=1, le=AUDIT_PAGE_MAX),
+    auth=Depends(require_api_key),
+):
     # T08: audit entries are scoped to the caller's tenant (actor is the
     # tenant id). The chain itself is still verified whole in /audit/verify.
     _flush_denials()  # summaries of closed denial windows show up right away
@@ -457,15 +477,43 @@ def list_audit(limit: int = 100, auth=Depends(require_api_key)):
 
 
 @app.get("/audit/verify")
-def verify_audit(
-    after_seq: int = 0,
+def verify_audit(auth=Depends(require_tenant_auth)):
+    """Tenant admin view: is the (platform-wide) audit chain intact?
+
+    Only {"ok": bool}. The chain spans every tenant, so counts, sequence
+    numbers and hashes would reveal other tenants' activity volume; they are
+    on the operator endpoint. Agent keys get 403: each call scans the whole
+    log, which an agent must not be able to trigger at will.
+    """
+    _flush_denials()
+    return {"ok": audit.verify_chain()["ok"]}
+
+
+@app.get("/ops/audit/verify")
+def ops_verify_audit(
+    after_seq: int = Query(0, ge=0),
     anchor_hash: str | None = None,
-    auth=Depends(require_api_key),
+    auth=Depends(require_operator_auth),
 ):
-    """Whole chain by default. For an incremental check pass after_seq plus
-    the head_hash you kept from an earlier run (never read back from the log)."""
+    """Operator view: full result (checked, head_seq, head_hash or
+    broken_at_seq). Whole chain by default; for an incremental check pass
+    after_seq plus the head_hash kept from an earlier run (never read back
+    from the log). Keep checkpoints where the Hub cannot write."""
     _flush_denials()
     try:
         return audit.verify_chain(after_seq=after_seq, anchor_hash=anchor_hash)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/ops/audit")
+def ops_list_audit(
+    limit: int = Query(100, ge=1, le=AUDIT_PAGE_MAX),
+    actor: str | None = None,
+    auth=Depends(require_operator_auth),
+):
+    """Operator view of the audit log across tenants, newest first. Optional
+    actor filter, e.g. sys:unauthenticated for refused unauthenticated
+    requests, which no tenant can read."""
+    _flush_denials()
+    return audit.list_audit(limit, actor=actor)

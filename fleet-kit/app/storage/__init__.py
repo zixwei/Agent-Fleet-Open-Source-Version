@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
     target TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '{}'
 );
+-- Query-path indexes. Every column below exists in the oldest schema, so
+-- creating them on an existing database is safe; IF NOT EXISTS keeps
+-- init_db idempotent.
+-- GET /audit (actor = ? ORDER BY seq DESC LIMIT ?)
+CREATE INDEX IF NOT EXISTS idx_audit_actor_seq ON audit_log (actor, seq);
+-- correlate_task (actor = ? AND target = ? ORDER BY seq)
+CREATE INDEX IF NOT EXISTS idx_audit_actor_target_seq ON audit_log (actor, target, seq);
+-- list_messages (task_id = ? ORDER BY created_at), receipts by message_id
+CREATE INDEX IF NOT EXISTS idx_messages_task_created ON messages (task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages (message_id);
+-- GET /tasks (tenant_id = ? ORDER BY created_at)
+CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks (tenant_id, created_at);
 """
 
 

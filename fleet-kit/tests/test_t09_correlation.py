@@ -218,7 +218,7 @@ def test_denied_requests_are_audited(client, fresh_db):
     assert forbidden["detail"]["principal"] == {"kind": "agent", "agent_id": "orch"}
     assert forbidden["detail"]["method"] == "POST" and forbidden["detail"]["path"] == f"/tasks/{tid}/status"
     actors_401 = {e["actor"] for e in by_status[401]}
-    assert actors_401 == {"unauthenticated", "tenant-a"}
+    assert actors_401 == {"sys:unauthenticated", "tenant-a"}
     ghost = [e for e in by_status[401] if e["actor"] == "tenant-a"][0]
     assert ghost["detail"]["principal"] == {"kind": "refused_agent_key", "agent_id": "ghost"}
     # The presented key is never stored.

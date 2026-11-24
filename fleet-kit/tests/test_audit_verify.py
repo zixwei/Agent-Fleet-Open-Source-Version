@@ -145,7 +145,12 @@ def test_log_shorter_than_checkpoint_is_reported(fresh_db):
     assert cut["head_seq"] == 15
 
 
-def test_verify_endpoint(monkeypatch):
+OPERATOR_KEY = "op-key-0123456789abcdef-xyz"
+
+
+def test_verify_endpoint_tenant_admin_sees_only_ok(monkeypatch, fresh_db):
+    """Tenant admins learn only whether the chain is intact: no counts, seq
+    numbers or hashes of the platform-wide log."""
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps({"key-a": "tenant-a"}))
@@ -154,15 +159,32 @@ def test_verify_endpoint(monkeypatch):
     client = TestClient(app)
     headers = {"X-API-Key": "key-a"}
     _fill(5)
-    r = client.get("/audit/verify", headers=headers)
+    assert client.get("/audit/verify", headers=headers).json() == {"ok": True}
+    # Old incremental parameters are ignored here (operator endpoint only).
+    assert client.get("/audit/verify", params={"after_seq": 3}, headers=headers).json() == {"ok": True}
+    _tamper(fresh_db, 2)
+    assert client.get("/audit/verify", headers=headers).json() == {"ok": False}
+
+
+def test_verify_endpoint_operator_gets_details(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps({"key-a": "tenant-a"}))
+    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", OPERATOR_KEY)
+    from app.main import app
+
+    client = TestClient(app)
+    op = {"X-API-Key": OPERATOR_KEY}
+    _fill(5)
+    r = client.get("/ops/audit/verify", headers=op)
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True and body["checked"] == 5 and body["head_seq"] == 5
     r = client.get(
-        "/audit/verify",
+        "/ops/audit/verify",
         params={"after_seq": body["head_seq"], "anchor_hash": body["head_hash"]},
-        headers=headers,
+        headers=op,
     )
     assert r.json()["ok"] is True and r.json()["checked"] == 0
-    r = client.get("/audit/verify", params={"after_seq": 3}, headers=headers)
-    assert r.status_code == 400
+    assert client.get("/ops/audit/verify", params={"after_seq": 3}, headers=op).status_code == 400
+    assert client.get("/ops/audit/verify", params={"after_seq": -1}, headers=op).status_code == 422

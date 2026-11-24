@@ -37,7 +37,7 @@ def _limiter(clock, **overrides):
 
 
 def _unauth(lim, source="1.2.3.4", status=401, route="/tasks"):
-    return lim.decide(actor="unauthenticated", principal=UNAUTH, source=source, status=status, route=route)
+    return lim.decide(actor="sys:unauthenticated", principal=UNAUTH, source=source, status=status, route=route)
 
 
 # ---------------------------------------------------------------- limiter
@@ -53,7 +53,7 @@ def test_source_budget_then_summary_on_next_window():
     assert write is True  # new window, new budget
     assert len(summaries) == 1
     s = summaries[0]
-    assert s["actor"] == "unauthenticated"
+    assert s["actor"] == "sys:unauthenticated"
     d = s["detail"]
     assert d["suppressed"] == 999 and d["logged_individually"] == 1
     assert d["statuses"] == {"401": 999} and d["routes"] == {"/tasks": 999}
@@ -235,16 +235,16 @@ def test_unauthenticated_flood_is_bounded(client, fresh_db, clock):
         assert client.get("/tasks", headers={"X-API-Key": f"bad-key-{i}"}).status_code == 401
     denied = _rows(fresh_db, action="request.denied")
     assert len(denied) == 1
-    assert denied[0]["actor"] == "unauthenticated"
+    assert denied[0]["actor"] == "sys:unauthenticated"
     assert denied[0]["detail"]["source"] == "testclient"
     assert len(_rows(fresh_db)) == total_before + 1
 
     clock.t += 60
     verify = client.get("/audit/verify", headers=ADMIN).json()  # flushes, then verifies
-    assert verify["ok"] is True
+    assert verify == {"ok": True}
     (summary,) = _rows(fresh_db, action="request.denied.summary")
     d = summary["detail"]
-    assert summary["actor"] == "unauthenticated"
+    assert summary["actor"] == "sys:unauthenticated"
     assert d["suppressed"] == 299 and d["statuses"] == {"401": 299}
     assert d["routes"] == {"/tasks": 299}
     assert "bad-key-" not in json.dumps(_rows(fresh_db))

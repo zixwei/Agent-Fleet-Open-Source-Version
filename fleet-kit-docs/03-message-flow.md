@@ -98,9 +98,15 @@ POST /tasks/{task_id}/status
 
 ## 阶段 6：审计
 
-每次关键写操作追加 hash 链。`GET /audit/verify` 默认从 `GENESIS` 起 **校验整条链**（分批读取，条数不限），任何一条被改都会报 `broken_at_seq`。返回的 `head_seq` / `head_hash` 是检查点：
+每次关键写操作追加 hash 链。校验总是从 `GENESIS` 起 **校验整条链**（分批读取，条数不限），任何一条被改都会被发现。
 
-- 增量校验：`GET /audit/verify?after_seq=<head_seq>&anchor_hash=<head_hash>`。锚点必须由调用方提供（取自上一次成功校验），**不从日志里读**，否则被改写的日志可以自证清白。
+| 接口 | 凭证 | 返回 |
+| --- | --- | --- |
+| `GET /audit/verify` | 租户管理员 Key（Agent Key → `403`） | 只有 `{"ok": true/false}`。链跨所有租户，计数、序号、hash 会暴露其它租户的活动量，所以不给 |
+| `GET /ops/audit/verify` | 运维 Key（`AI_FLEET_OPERATOR_API_KEY`） | 完整结果：`checked`、`head_seq`、`head_hash` 或 `broken_at_seq`；支持增量校验 |
+| `GET /ops/audit?actor=&limit=` | 运维 Key | 跨租户查看审计，例如 `actor=sys:unauthenticated` |
+
+- 增量校验：`GET /ops/audit/verify?after_seq=<head_seq>&anchor_hash=<head_hash>`。锚点必须由调用方提供（取自上一次成功校验），**不从日志里读**，否则被改写的日志可以自证清白。
 - 检查点要存到 Hub 写不到的地方。hash 链本身发现不了「最新几条被整段删掉」；拿保存的检查点去比，才能发现（日志比检查点短 → `ok: false`）。
 
 ### 关联（T09）
@@ -108,7 +114,7 @@ POST /tasks/{task_id}/status
 - 每个任务创建时生成 `trace_id`；任务上的消息默认沿用它（调用方只在传播外部链路时才自带 `trace_id`）。回复时用 `correlation_id` 填被回复的 `message_id`。
 - 消息表持久化 `trace_id`、`correlation_id`、`context_id`、`protocol`、`protocol_version`。
 - 审计 `actor` 仍是租户（`GET /audit` 按它隔离）；真正动手的凭证记在 `detail.principal = {kind, agent_id}`。消息、回执审计都带 `message_id`、`trace_id`；状态变更记 `from` / `to`。这些字段都在被 hash 的 `detail` 里。
-- 被拒的请求（`401/403/404/409`）记为 `request.denied`，记在调用方租户名下；被拒的 Agent Key 记在它所属的租户名下（`principal.kind = refused_agent_key`）；未认证的记在 `unauthenticated` 名下。**提交的 Key 本身不落库。** 不存在的路由不记。`path` / `reason` 超过 256 字符截断（`path_truncated: true`）。
+- 被拒的请求（`401/403/404/409`）记为 `request.denied`，记在调用方租户名下；被拒的 Agent Key 记在它所属的租户名下（`principal.kind = refused_agent_key`）；未认证的记在系统名 `sys:unauthenticated` 名下（租户 id 不能含 `:`，所以没有租户能读到它们，只有运维 Key 能通过 `/ops/audit` 查看）。**提交的 Key 本身不落库。** 不存在的路由不记。`path` / `reason` 超过 256 字符截断（`path_truncated: true`）。
 - **防刷（`app/observability/denials.py`）**：按固定时间窗口计数。每个窗口里，每个未认证来源只单独记前 `AI_FLEET_DENIAL_PER_SOURCE` 条，每个凭证（租户、Agent、被拒的 Agent Key）只单独记前 `AI_FLEET_DENIAL_PER_PRINCIPAL` 条，全部加起来不超过 `AI_FLEET_DENIAL_MAX_INDIVIDUAL` 条；其余只计数，窗口结束后写成一条 `request.denied.summary`（数量、状态码分布、路由模板分布、来源）。未认证来源最多分 `AI_FLEET_DENIAL_MAX_SOURCES` 个桶，再多的来源进同一个溢出桶。所以不管请求多少、来源怎么伪造，每个窗口的审计写入都有上限。汇总在下一次被拒、`GET /audit`、`GET /audit/verify` 或进程关闭时写入。
 
   | 环境变量 | 默认 | 含义 |
@@ -135,5 +141,5 @@ Admin          Orchestrator           Hub              Worker
   |                 |                  |<--result msg-----|
   |                 |<--receipt--------|                  |
   |                 |                  |<--status completed
-  |--audit/verify--------------------->|                  |
+  |--audit/verify (ok only)----------->|                  |
 ```

@@ -6,8 +6,9 @@ chain alone is not tamper-proof; it is evidence, not a guarantee.
 
 T09 (audit record correlation): correlation fields live inside `detail`,
 which is part of the entry hash, so they are integrity-protected like the
-rest of the entry. `actor` stays the tenant id (it scopes GET /audit); the
-acting credential is detail["principal"] = {"kind": "tenant"|"agent",
+rest of the entry. `actor` stays the tenant id (it scopes GET /audit), or a
+"sys:" system actor (sys:unauthenticated, sys:operator) that no tenant id
+can equal; the acting credential is detail["principal"] = {"kind": "tenant"|"agent",
 "agent_id"}. correlate_task() checks one task's messages, receipts and
 status against its audit entries.
 """
@@ -115,7 +116,8 @@ def verify_chain(after_seq: int = 0, anchor_hash: str | None = None, batch: int 
 
 
 def principal(auth: dict) -> dict:
-    """The acting credential as recorded in audit detail (never the key)."""
+    """The acting credential as recorded in audit detail (never the key).
+    kind: "tenant" | "agent" | "operator"."""
     return {"kind": auth.get("auth_kind"), "agent_id": auth.get("agent_id")}
 
 
