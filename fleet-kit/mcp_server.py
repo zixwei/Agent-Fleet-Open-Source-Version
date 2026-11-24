@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Fleet Kit MCP facade — thin tool layer over the Hub HTTP API.
 
-Identity comes from env FLEET_AGENT_API_KEY (or FLEET_API_KEY for tenant
-admin tools). Message bodies never decide who you are.
+Identity comes from env FLEET_AGENT_API_KEY only: one MCP host config = one
+agent. The tenant admin key (FLEET_API_KEY) must never be put in a host
+config; registering, approving and suspending agents are deliberately not
+exposed as tools. Message bodies never decide who you are.
 
 Tools: create_task, post_message, get_task, list_messages, receipt, set_status
 """
@@ -10,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
 
 import httpx
@@ -17,8 +20,15 @@ from mcp.server.fastmcp import FastMCP
 
 HUB_URL = os.environ.get("FLEET_HUB_URL", "http://127.0.0.1:8000").rstrip("/")
 AGENT_KEY = os.environ.get("FLEET_AGENT_API_KEY", "")
-TENANT_KEY = os.environ.get("FLEET_API_KEY", "")
 AGENT_ID = os.environ.get("FLEET_AGENT_ID", "")
+
+if os.environ.get("FLEET_API_KEY"):
+    # stderr: stdout carries the MCP stdio protocol.
+    print(
+        "fleet-kit MCP: FLEET_API_KEY is set but ignored; remove the tenant "
+        "admin key from this host config (agent key only).",
+        file=sys.stderr,
+    )
 
 mcp = FastMCP(
     "fleet-kit",
@@ -29,11 +39,10 @@ mcp = FastMCP(
 )
 
 
-def _headers(prefer_agent: bool = True) -> dict[str, str]:
-    key = AGENT_KEY if (prefer_agent and AGENT_KEY) else (TENANT_KEY or AGENT_KEY)
-    if not key:
-        raise RuntimeError("Set FLEET_AGENT_API_KEY and/or FLEET_API_KEY")
-    return {"X-API-Key": key, "Content-Type": "application/json"}
+def _headers() -> dict[str, str]:
+    if not AGENT_KEY:
+        raise RuntimeError("Set FLEET_AGENT_API_KEY (this host's agent key)")
+    return {"X-API-Key": AGENT_KEY, "Content-Type": "application/json"}
 
 
 def _client() -> httpx.Client:
@@ -52,11 +61,15 @@ def _json(resp: httpx.Response) -> Any:
 
 @mcp.tool()
 def create_task(agent_id: str, title: str) -> str:
-    """Create a task assigned to an Active agent. Uses tenant/admin key."""
+    """Create a task assigned to an Active agent in your tenant.
+
+    You are recorded as the task's creator: you may cancel it later; only the
+    assigned agent can move it to working/completed/failed.
+    """
     with _client() as c:
         r = c.post(
             "/tasks",
-            headers=_headers(prefer_agent=False),
+            headers=_headers(),
             json={"agent_id": agent_id, "title": title},
         )
     return json.dumps(_json(r), ensure_ascii=False)
@@ -69,8 +82,15 @@ def post_message(
     payload_json: str = "{}",
     recipient_agent_id: str | None = None,
     sender_agent_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> str:
-    """Post a message on a task. Sender is the authenticated agent when an agent key is set."""
+    """Post a message on a task. Sender must be the authenticated agent.
+
+    idempotency_key: pick a stable value per logical message (for example
+    "<task_id>:assign:1") and reuse it when retrying after a timeout or
+    error; the Hub then returns the stored message (stored=false) instead
+    of recording a second one. Use a new value for a new message.
+    """
     try:
         payload = json.loads(payload_json) if payload_json else {}
     except json.JSONDecodeError as e:
@@ -87,10 +107,12 @@ def post_message(
     }
     if recipient_agent_id:
         body["recipient_agent_id"] = recipient_agent_id
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
     with _client() as c:
         r = c.post(
             f"/tasks/{task_id}/messages",
-            headers=_headers(prefer_agent=True),
+            headers=_headers(),
             json=body,
         )
     return json.dumps(_json(r), ensure_ascii=False)
@@ -114,13 +136,11 @@ def list_messages(task_id: str) -> str:
 
 @mcp.tool()
 def receipt(task_id: str, message_id: str) -> str:
-    """Confirm delivery of a message. Requires FLEET_AGENT_API_KEY for the recipient."""
-    if not AGENT_KEY:
-        return json.dumps({"ok": False, "error": "FLEET_AGENT_API_KEY required for receipt"})
+    """Confirm delivery of a message addressed to you."""
     with _client() as c:
         r = c.post(
             f"/tasks/{task_id}/messages/{message_id}/receipt",
-            headers=_headers(prefer_agent=True),
+            headers=_headers(),
             json={},
         )
     return json.dumps(_json(r), ensure_ascii=False)
@@ -128,11 +148,16 @@ def receipt(task_id: str, message_id: str) -> str:
 
 @mcp.tool()
 def set_status(task_id: str, status: str) -> str:
-    """Move task status: submitted -> working -> completed|failed|cancelled."""
+    """Move task status: submitted -> working -> completed|failed|cancelled.
+
+    The assigned agent may move its own task; the creator may only cancel.
+    403 = not allowed for you; 409 = someone else changed the task first,
+    re-read it with get_task before retrying.
+    """
     with _client() as c:
         r = c.post(
             f"/tasks/{task_id}/status",
-            headers=_headers(prefer_agent=False),
+            headers=_headers(),
             json={"status": status},
         )
     return json.dumps(_json(r), ensure_ascii=False)

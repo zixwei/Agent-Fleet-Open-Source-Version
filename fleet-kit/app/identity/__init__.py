@@ -56,11 +56,13 @@ def require_api_key(x_api_key: str | None = Header(default=None)):
         tenant_id = entry.get("tenant_id") if isinstance(entry, dict) else None
         if not agent_id or not tenant_id:
             raise HTTPException(status_code=401, detail="invalid agent credential")
-        # The credential is live only while its agent is registered and
-        # Active; suspending the agent revokes it.
+        # The credential is live only while its agent is registered in the
+        # credential's own tenant and Active; suspending the agent revokes
+        # it. (Looking the agent up globally let a key that names another
+        # tenant's agent pass as live.)
         from app import registry
 
-        agent = registry.get_agent(agent_id)
+        agent = registry.get_agent(agent_id, tenant_id=tenant_id)
         if agent is None or agent["status"] != "Active":
             raise HTTPException(status_code=401, detail="invalid agent credential")
         return {"tenant_id": tenant_id, "agent_id": agent_id, "auth_kind": "agent"}

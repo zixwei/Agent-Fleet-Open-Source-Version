@@ -6,10 +6,12 @@
 
 | 种类 | 环境变量 | 解析结果 | 典型用途 |
 | --- | --- | --- | --- |
-| 租户 Key | `AI_FLEET_API_KEY` 或 `AI_FLEET_TENANT_API_KEYS` JSON | `{tenant_id, agent_id: null}` | 注册/审批/挂起、建任务、改状态、列审计 |
-| Agent Key | `AI_FLEET_AGENT_API_KEYS` JSON | `{tenant_id, agent_id}` | 发消息、回执 |
+| 租户 Key | `AI_FLEET_API_KEY` 或 `AI_FLEET_TENANT_API_KEYS` JSON | `{tenant_id, agent_id: null}` | 注册/审批/挂起、运维兜底改状态、列审计 |
+| Agent Key | `AI_FLEET_AGENT_API_KEYS` JSON | `{tenant_id, agent_id}` | 建任务、发消息、回执、推进自己被指派的任务 |
 
-Agent Key 仅在对应 Agent **已注册且 Active** 时有效。
+Agent Key 仅在对应 Agent **在该 Key 所属租户内已注册且 Active** 时有效；Key 里写的 Agent 不在本租户 → `401`。
+
+**租户 Key 不进任何 MCP 宿主配置。** 宿主只放自己的 Agent Key（见 `mcp-host.example.json`）；`mcp_server.py` 发现 `FLEET_API_KEY` 会忽略并提示。任务状态的权限见 [03 阶段 5](03-message-flow.md)。
 
 ## 管理员门禁
 

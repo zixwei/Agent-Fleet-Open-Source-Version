@@ -16,15 +16,15 @@
 
 ## 阶段 1：创建任务
 
-管理员（或持有租户 Key 的 MCP 工具 `create_task`）：
+编排方用 **自己的 Agent Key**（MCP 工具 `create_task`）；管理员用租户 Key 也可以建：
 
 ```http
 POST /tasks
-X-API-Key: <tenant-key>
+X-API-Key: <orchestrator-agent-key>
 {"agent_id":"worker","title":"…"}
 ```
 
-结果：任务 `submitted`，绑定到本租户与执行 Agent。返回 `task_id`——之后所有消息都挂在这个 id 上。
+结果：任务 `submitted`，绑定到本租户与执行 Agent，并记录 `created_by_agent_id`（用租户 Key 创建时为 `null`）。返回 `task_id`——之后所有消息都挂在这个 id 上。
 
 ## 阶段 2：编排方下发
 
@@ -85,11 +85,23 @@ POST /tasks/{task_id}/status
 - `working` → `completed` | `failed` | `cancelled`
 - 终态不可再迁
 
-实现用 **CAS**：`UPDATE ... WHERE status = 旧状态`。两个并发请求不能都从 `submitted` 成功走出不同终态而不冲突。
+谁能改：
+
+| 凭证 | 允许的目标状态 |
+| --- | --- |
+| 任务的执行 Agent（`agent_id`） | `working` / `completed` / `failed` / `cancelled` |
+| 任务的创建 Agent（`created_by_agent_id`） | 只能 `cancelled` |
+| 同租户其它 Agent | 无（`403`） |
+| 租户管理员 Key | 任意合法迁移（运维兜底） |
+
+实现用 **CAS**：`UPDATE ... WHERE status = 旧状态`。两个并发请求不能都从同一状态成功走出不同结果；输掉竞争的一方得到 **`409`**，应先 `get_task` 重读再决定是否重试。非法迁移仍是 `400`。
 
 ## 阶段 6：审计
 
-每次关键写操作追加 hash 链。`GET /audit/verify` 在连续窗口上重算；窗口首条锚定其记录的 `prev_hash`（可能是 `GENESIS` 或窗外前驱），避免「只取最新 1000 条却从 GENESIS 验」的假失败。
+每次关键写操作追加 hash 链。`GET /audit/verify` 默认从 `GENESIS` 起 **校验整条链**（分批读取，条数不限），任何一条被改都会报 `broken_at_seq`。返回的 `head_seq` / `head_hash` 是检查点：
+
+- 增量校验：`GET /audit/verify?after_seq=<head_seq>&anchor_hash=<head_hash>`。锚点必须由调用方提供（取自上一次成功校验），**不从日志里读**，否则被改写的日志可以自证清白。
+- 检查点要存到 Hub 写不到的地方。hash 链本身发现不了「最新几条被整段删掉」；拿保存的检查点去比，才能发现（日志比检查点短 → `ok: false`）。
 
 ## 时序简图
 
@@ -97,11 +109,12 @@ POST /tasks/{task_id}/status
 Admin          Orchestrator           Hub              Worker
   |                 |                  |                  |
   |--register/approve----------------->|                  |
-  |--create_task---------------------->|                  |
+  |                 |--create_task---->|                  |
   |                 |--assign msg----->|                  |
   |                 |                  |<--receipt--------|
+  |                 |                  |<--status working-|
   |                 |                  |<--result msg-----|
   |                 |<--receipt--------|                  |
-  |--status completed----------------->|                  |
+  |                 |                  |<--status completed
   |--audit/verify--------------------->|                  |
 ```

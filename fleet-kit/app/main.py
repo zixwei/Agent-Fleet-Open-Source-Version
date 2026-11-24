@@ -8,13 +8,14 @@ Endpoints (all except /health require X-API-Key):
   POST /tasks               create a task for an Active agent
   GET  /tasks               list tasks
   GET  /tasks/{id}          get task status
-  POST /tasks/{id}/status   move a task (submitted->working->completed/failed/cancelled)
+  POST /tasks/{id}/status   move a task (submitted->working->completed/failed/cancelled;
+                            agent keys: assignee, or creator for cancel; 409 on a lost race)
   POST /tasks/{id}/messages send a message (idempotent on idempotency_key)
   POST /tasks/{id}/messages/{message_id}/receipt
        recipient confirms delivery (formal T01 acceptance; idempotent)
   GET  /tasks/{id}/messages list messages for a task (each carries its receipt, if any)
   GET  /audit               append-only audit log (hash-chained)
-  GET  /audit/verify        verify the audit hash chain
+  GET  /audit/verify        verify the whole audit hash chain (or from a kept checkpoint)
   GET  /health              health check (no auth)
 
 Run:  uvicorn app.main:app --host 127.0.0.1 --port 8000
@@ -94,11 +95,21 @@ class TaskIn(BaseModel):
 
 @app.post("/tasks")
 def create_task(body: TaskIn, auth=Depends(require_api_key)):
+    # An agent credential may create tasks in its own tenant; that agent is
+    # recorded as the creator (it may later cancel the task, nothing more).
     try:
-        task = orchestration.create_task(auth["tenant_id"], body.agent_id, body.title)
+        task = orchestration.create_task(
+            auth["tenant_id"], body.agent_id, body.title,
+            created_by_agent_id=auth.get("agent_id"),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    audit.record(auth["tenant_id"], "task.create", task["task_id"], {"agent_id": body.agent_id})
+    audit.record(
+        auth["tenant_id"],
+        "task.create",
+        task["task_id"],
+        {"agent_id": body.agent_id, "created_by_agent_id": auth.get("agent_id")},
+    )
     return task
 
 
@@ -128,9 +139,20 @@ class StatusIn(BaseModel):
 
 @app.post("/tasks/{task_id}/status")
 def set_task_status(task_id: str, body: StatusIn, auth=Depends(require_api_key)):
-    _get_task_for_tenant(task_id, auth["tenant_id"])
+    task = _get_task_for_tenant(task_id, auth["tenant_id"])
+    if body.status not in orchestration.VALID_TRANSITIONS:
+        raise HTTPException(status_code=400, detail=f"unknown status {body.status}")
+    # Key split: an agent credential may only move tasks it is assigned to
+    # (or cancel tasks it created). See orchestration module docstring.
+    if not orchestration.can_request_status(task, auth, body.status):
+        raise HTTPException(
+            status_code=403,
+            detail="this credential may not move this task to that status",
+        )
     try:
         task = orchestration.set_status(task_id, body.status)
+    except orchestration.TransitionConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     audit.record(auth["tenant_id"], "task.status", task_id, {"status": body.status})
@@ -250,5 +272,14 @@ def list_audit(limit: int = 100, auth=Depends(require_api_key)):
 
 
 @app.get("/audit/verify")
-def verify_audit(auth=Depends(require_api_key)):
-    return audit.verify_chain()
+def verify_audit(
+    after_seq: int = 0,
+    anchor_hash: str | None = None,
+    auth=Depends(require_api_key),
+):
+    """Whole chain by default. For an incremental check pass after_seq plus
+    the head_hash you kept from an earlier run (never read back from the log)."""
+    try:
+        return audit.verify_chain(after_seq=after_seq, anchor_hash=anchor_hash)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

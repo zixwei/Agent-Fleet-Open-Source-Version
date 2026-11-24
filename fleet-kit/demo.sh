@@ -36,7 +36,10 @@ print(json.dumps({
 PY
 )
 
-python3 -m pip install --user -q -r requirements.txt
+# CI installs dependencies itself and sets FLEET_SKIP_PIP=1.
+if [[ "${FLEET_SKIP_PIP:-0}" != "1" ]]; then
+  python3 -m pip install --user -q -r requirements.txt
+fi
 
 HUB_LOG="${ROOT}/.demo-hub.log"
 python3 -m uvicorn app.main:app --host 127.0.0.1 --port "$PORT" >"$HUB_LOG" 2>&1 &
@@ -57,6 +60,7 @@ TASK_ID=$(python3 -c "import re,sys; t=open('.demo-out.txt').read(); m=re.search
 export FLEET_DEMO_TASK_ID="$TASK_ID"
 export FLEET_API_KEY FLEET_AGENT_A_KEY FLEET_AGENT_B_KEY
 export FLEET_AGENT_API_KEY="$FLEET_AGENT_A_KEY"
-python3 scripts/mcp_http_parity.py
+# MCP path runs without the tenant admin key: hosts carry agent keys only.
+env -u FLEET_API_KEY python3 scripts/mcp_http_parity.py
 
 echo "demo.sh PASS"

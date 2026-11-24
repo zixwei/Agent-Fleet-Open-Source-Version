@@ -67,13 +67,18 @@ def main() -> None:
         code, body = req("POST", f"/agents/{agent_id}/approve", TENANT_KEY)
         must(code == 200 and body.get("status") == "Active", f"approve {agent_id}")
 
+    # Agent keys cannot do admin operations (register/approve/suspend).
+    code, _ = req("POST", "/agents/orchestrator/suspend", AGENT_B_KEY)
+    must(code == 403, f"worker key cannot suspend another agent (got {code})")
+
+    # The orchestrator creates the task with its own agent key.
     code, task = req(
         "POST",
         "/tasks",
-        TENANT_KEY,
+        AGENT_A_KEY,
         {"agent_id": "worker", "title": "fleet-kit demo: summarize ok"},
     )
-    must(code == 200, f"create_task {task}")
+    must(code == 200 and task.get("created_by_agent_id") == "orchestrator", f"create_task {task}")
     task_id = task["task_id"]
     print(f"task_id={task_id}")
 
@@ -94,9 +99,22 @@ def main() -> None:
     must(message.get("protocol") == "fleet", f"protocol is fleet not a2a ({message.get('protocol')})")
     must(message["sender_agent_id"] != message["recipient_agent_id"], "two different agent ids on message")
 
-    # Idempotent republish via Hub bus is covered in pytest; here re-post same logical
-    # fields creates a NEW message_id (envelope builds new ids). Dedup is on idempotency_key
-    # inside one envelope — exercise receipt duplicate instead.
+    # Client retry with a stable idempotency_key: the second POST is a no-op.
+    retry_body = {
+        "sender_agent_id": "orchestrator",
+        "recipient_agent_id": "worker",
+        "event_type": "task.note",
+        "payload": {"note": "retry-safe"},
+        "idempotency_key": f"{task_id}:note:1",
+    }
+    code, first = req("POST", f"/tasks/{task_id}/messages", AGENT_A_KEY, retry_body)
+    must(code == 200 and first.get("stored") is True, f"keyed message {first}")
+    code, again = req("POST", f"/tasks/{task_id}/messages", AGENT_A_KEY, retry_body)
+    must(
+        code == 200 and again.get("stored") is False
+        and again["message"]["message_id"] == first["message"]["message_id"],
+        f"retry with same idempotency_key is a no-op {again}",
+    )
 
     code, ack = req(
         "POST",
@@ -134,19 +152,23 @@ def main() -> None:
     )
     must(code == 200, "orchestrator receipts reply")
 
-    code, _ = req("POST", f"/tasks/{task_id}/status", TENANT_KEY, {"status": "working"})
-    must(code == 200, "status working")
-    code, done = req("POST", f"/tasks/{task_id}/status", TENANT_KEY, {"status": "completed"})
+    # Only the assignee (worker) moves the task; the orchestrator is refused.
+    code, _ = req("POST", f"/tasks/{task_id}/status", AGENT_A_KEY, {"status": "working"})
+    must(code == 403, f"non-assignee cannot move the task (got {code})")
+    code, _ = req("POST", f"/tasks/{task_id}/status", AGENT_B_KEY, {"status": "working"})
+    must(code == 200, "status working (assignee)")
+    code, done = req("POST", f"/tasks/{task_id}/status", AGENT_B_KEY, {"status": "completed"})
     must(code == 200 and done.get("status") == "completed", f"status completed {done}")
 
     code, task_view = req("GET", f"/tasks/{task_id}", TENANT_KEY)
     must(code == 200 and task_view.get("status") == "completed", "get_task completed")
 
     code, msgs = req("GET", f"/tasks/{task_id}/messages", TENANT_KEY)
-    must(code == 200 and isinstance(msgs, list) and len(msgs) >= 2, f"list_messages n={len(msgs) if isinstance(msgs, list) else msgs}")
+    # assign + keyed note (once, despite the retry) + result = 3
+    must(code == 200 and isinstance(msgs, list) and len(msgs) == 3, f"list_messages n={len(msgs) if isinstance(msgs, list) else msgs}")
 
     code, verify = req("GET", "/audit/verify", TENANT_KEY)
-    must(code == 200 and verify.get("ok") is True, f"audit verify {verify}")
+    must(code == 200 and verify.get("ok") is True, f"audit verify (whole chain) {verify}")
 
     if OTHER_TENANT_KEY:
         code, cross = req("GET", f"/tasks/{task_id}", OTHER_TENANT_KEY)

@@ -12,22 +12,21 @@ Fleet Kit 不发明新宿主协议，只把 Hub 的 HTTP 收成六个工具，�
 | 变量 | 含义 |
 | --- | --- |
 | `FLEET_HUB_URL` | Hub 根地址，如 `http://127.0.0.1:8765` |
-| `FLEET_API_KEY` | 租户 Key（建任务、改状态） |
-| `FLEET_AGENT_API_KEY` | Agent Key（发消息、回执） |
+| `FLEET_AGENT_API_KEY` | 本宿主的 Agent Key：所有工具都用它 |
 | `FLEET_AGENT_ID` | 默认 `sender_agent_id` |
 
-编排方与执行方应使用 **两份** MCP 配置（两套 Key），见 `fleet-kit/mcp-host.example.json`。
+编排方与执行方应使用 **两份** MCP 配置（两套 Agent Key），见 `fleet-kit/mcp-host.example.json`。**不要**把租户管理员 Key（`FLEET_API_KEY`）放进宿主配置；注册/审批/挂起 Agent 故意不做成工具。
 
 ## 工具 ↔ HTTP
 
 | MCP 工具 | Hub |
 | --- | --- |
-| `create_task(agent_id, title)` | `POST /tasks`（偏租户 Key） |
-| `post_message(task_id, event_type, payload_json, …)` | `POST /tasks/{id}/messages` |
+| `create_task(agent_id, title)` | `POST /tasks`（调用方记为创建者，之后可取消） |
+| `post_message(task_id, event_type, payload_json, …, idempotency_key)` | `POST /tasks/{id}/messages`；超时重试时复用同一个 `idempotency_key`，不会产生第二条消息 |
 | `get_task(task_id)` | `GET /tasks/{id}` |
 | `list_messages(task_id)` | `GET /tasks/{id}/messages` |
 | `receipt(task_id, message_id)` | `POST .../receipt`（必须 Agent Key） |
-| `set_status(task_id, status)` | `POST /tasks/{id}/status` |
+| `set_status(task_id, status)` | `POST /tasks/{id}/status`（执行方推进；创建方只能取消；`409` = 被别人抢先改了） |
 
 返回值是 JSON 字符串：`{ok, status, data|error}`，便于宿主展示。
 

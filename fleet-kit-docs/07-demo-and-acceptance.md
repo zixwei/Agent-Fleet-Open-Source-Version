@@ -24,6 +24,8 @@ cd fleet-kit
 python3 -m pytest tests/ -q
 ```
 
+CI：`.github/workflows/fleet-kit.yml` 在改动 `fleet-kit/` 的 PR 上跑单测和 `demo.sh`。
+
 ## Cursor 当仓库外宿主（S3）
 
 1. 先保证 Hub 在跑（可改 demo 不杀进程，或手动）：
@@ -51,9 +53,10 @@ python3 -m pytest tests/ -q
 | 无密钥绿路径 | `./demo.sh` → 0 |
 | 双 Agent + 单任务 | 日志 `orchestrator` / `worker` + 同一 `task_id` |
 | 回执幂等 | 第二次 receipt `stored: false` |
-| 客户端消息幂等 | `idempotency_key` 重试；消息列表长度不增 |
+| 客户端消息幂等 | HTTP 与 MCP 两条路径各重试一次同一 `idempotency_key`；消息列表长度不增 |
+| 最小权限 | Agent Key 调管理接口 `403`；非执行方改状态 `403`；MCP 路径全程不带租户 Key |
 | 跨租户 | 另一租户 Key → 404 |
-| 审计 | `/audit/verify` → `ok: true` |
+| 审计 | `/audit/verify` 校验整条链 → `ok: true`（超过 1000 条且有篡改的情况见 `tests/test_audit_verify.py`） |
 | MCP 同账本 | `mcp_http_parity` 或 Cursor 工具留下同一 `task_id` |
 | 口径 | README/`protocol` 为 `fleet`，无「已兼容 A2A」 |
 

@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'submitted',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    created_by_agent_id TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     idempotency_key TEXT PRIMARY KEY,
@@ -81,6 +82,13 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
             )
+        # Migrate older tasks tables (no creator column). NULL = created
+        # with a tenant/admin credential.
+        task_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "created_by_agent_id" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN created_by_agent_id TEXT")
         conn.commit()
 
 
@@ -145,8 +153,17 @@ def set_task_status_atomic(task_id, from_status, to_status, updated_at):
         return cur.rowcount > 0
 
 
+def audit_head():
+    """(seq, entry_hash) of the newest audit entry; (0, "GENESIS") when empty."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+    return (row["seq"], row["entry_hash"]) if row else (0, "GENESIS")
+
+
 def list_audit_from_seq(after_seq=0, limit=1000):
-    """Oldest-first window for chain verification."""
+    """Oldest-first batch of entries with seq > after_seq (chain verification)."""
     with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT ?",
@@ -160,11 +177,15 @@ def list_audit_from_seq(after_seq=0, limit=1000):
     return out
 
 
-def insert_task(task_id, tenant_id, agent_id, title, status, created_at, updated_at):
+def insert_task(
+    task_id, tenant_id, agent_id, title, status, created_at, updated_at,
+    created_by_agent_id=None,
+):
     with connect() as conn:
         conn.execute(
-            "INSERT INTO tasks VALUES (?,?,?,?,?,?,?)",
-            (task_id, tenant_id, agent_id, title, status, created_at, updated_at),
+            "INSERT INTO tasks (task_id, tenant_id, agent_id, title, status, created_at, updated_at, created_by_agent_id) VALUES (?,?,?,?,?,?,?,?)",
+            (task_id, tenant_id, agent_id, title, status, created_at, updated_at,
+             created_by_agent_id),
         )
         conn.commit()
 

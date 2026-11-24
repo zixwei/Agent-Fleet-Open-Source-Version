@@ -18,13 +18,13 @@ chmod +x demo.sh
 
 1. `FLEET_HUB_URL` / 端口（默认 `http://127.0.0.1:8765`）
 2. `FLEET_API_KEY` 与两个 agent key（`demo.sh` 已给演示值）
-3. MCP 宿主：复制 [mcp-host.example.json](mcp-host.example.json)，把 `/ABS/PATH/TO/fleet-kit` 换成本机路径，贴进 Cursor / Claude Code 等 MCP 配置
+3. MCP 宿主：复制 [mcp-host.example.json](mcp-host.example.json)，把 `/ABS/PATH/TO/fleet-kit` 换成本机路径，贴进 Cursor / Claude Code 等 MCP 配置。宿主里只放 **Agent Key**，租户管理员 Key 不进宿主配置
 
 ## MCP 工具
 
 `create_task` · `post_message` · `get_task` · `list_messages` · `receipt` · `set_status`
 
-身份来自 `FLEET_AGENT_API_KEY`，不信任消息正文自称。
+身份只来自 `FLEET_AGENT_API_KEY`，不信任消息正文自称。`post_message` 支持 `idempotency_key`，超时重试复用同一个值即可。执行方推进自己的任务，创建方只能取消。
 
 ## 非目标（1.0 不做）
 
