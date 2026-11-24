@@ -83,6 +83,8 @@ def post_message(
     recipient_agent_id: str | None = None,
     sender_agent_id: str | None = None,
     idempotency_key: str | None = None,
+    correlation_id: str | None = None,
+    trace_id: str | None = None,
 ) -> str:
     """Post a message on a task. Sender must be the authenticated agent.
 
@@ -90,6 +92,10 @@ def post_message(
     "<task_id>:assign:1") and reuse it when retrying after a timeout or
     error; the Hub then returns the stored message (stored=false) instead
     of recording a second one. Use a new value for a new message.
+
+    correlation_id: when replying, pass the message_id you are answering.
+    trace_id: leave empty (the task's trace is used) unless you are
+    propagating a trace that started outside the Hub.
     """
     try:
         payload = json.loads(payload_json) if payload_json else {}
@@ -109,6 +115,10 @@ def post_message(
         body["recipient_agent_id"] = recipient_agent_id
     if idempotency_key:
         body["idempotency_key"] = idempotency_key
+    if correlation_id:
+        body["correlation_id"] = correlation_id
+    if trace_id:
+        body["trace_id"] = trace_id
     with _client() as c:
         r = c.post(
             f"/tasks/{task_id}/messages",

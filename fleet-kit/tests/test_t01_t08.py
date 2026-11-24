@@ -174,9 +174,15 @@ def test_t08_cross_tenant_task_isolation():
     assert client.get("/tasks", headers=HEADERS_B).json() == []
     assert len(client.get("/tasks", headers=HEADERS_A).json()) == 1
 
-    # Audit list is tenant-scoped: B sees none of A's entries.
-    assert client.get("/audit", headers=HEADERS_B).json() == []
-    assert len(client.get("/audit", headers=HEADERS_A).json()) > 0
+    # Audit list is tenant-scoped: B sees none of A's entries. Since T09,
+    # B does see its own four refused attempts above (request.denied, 404).
+    b_entries = client.get("/audit", headers=HEADERS_B).json()
+    assert len(b_entries) == 4
+    assert all(e["action"] == "request.denied" and e["detail"]["status"] == 404 for e in b_entries)
+    assert "secret" not in json.dumps(b_entries)
+    a_actions = {e["action"] for e in client.get("/audit", headers=HEADERS_A).json()}
+    assert {"agent.register", "task.create"} <= a_actions
+    assert "request.denied" not in a_actions
 
     # Owner still fully works after the denied attempts.
     r = client.post(f"/tasks/{task_id}/status", json={"status": "working"}, headers=HEADERS_A)

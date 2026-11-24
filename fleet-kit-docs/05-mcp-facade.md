@@ -22,7 +22,7 @@ Fleet Kit 不发明新宿主协议，只把 Hub 的 HTTP 收成六个工具，�
 | MCP 工具 | Hub |
 | --- | --- |
 | `create_task(agent_id, title)` | `POST /tasks`（调用方记为创建者，之后可取消） |
-| `post_message(task_id, event_type, payload_json, …, idempotency_key)` | `POST /tasks/{id}/messages`；超时重试时复用同一个 `idempotency_key`，不会产生第二条消息 |
+| `post_message(task_id, event_type, payload_json, …, idempotency_key, correlation_id, trace_id)` | `POST /tasks/{id}/messages`；超时重试时复用同一个 `idempotency_key`，不会产生第二条消息；回复时 `correlation_id` 填被回复的 `message_id`；`trace_id` 留空即沿用任务的 |
 | `get_task(task_id)` | `GET /tasks/{id}` |
 | `list_messages(task_id)` | `GET /tasks/{id}/messages` |
 | `receipt(task_id, message_id)` | `POST .../receipt`（必须 Agent Key） |

@@ -14,14 +14,20 @@ Endpoints (all except /health require X-API-Key):
   POST /tasks/{id}/messages/{message_id}/receipt
        recipient confirms delivery (formal T01 acceptance; idempotent)
   GET  /tasks/{id}/messages list messages for a task (each carries its receipt, if any)
+  GET  /tasks/{id}/correlation T09: messages/receipts/status vs. audit entries
   GET  /audit               append-only audit log (hash-chained)
   GET  /audit/verify        verify the whole audit hash chain (or from a kept checkpoint)
   GET  /health              health check (no auth)
 
 Run:  uvicorn app.main:app --host 127.0.0.1 --port 8000
 """
-from fastapi import Depends, FastAPI, HTTPException
+import logging
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import config
 from app.identity import require_agent_auth, require_api_key, require_tenant_auth
@@ -32,11 +38,60 @@ from app import orchestration
 from app import storage as db
 
 app = FastAPI(title="Agent Fleet Hub", version="1.0.0-fleet-kit")
+logger = logging.getLogger("agent_fleet_hub")
 
 
 @app.on_event("startup")
 def startup():
     db.init_db()
+
+
+# T09 / whitepaper §8.3 "security anomalies": requests our code refuses are
+# audited. Only fastapi.HTTPException raised by this app counts; Starlette's
+# own 404/405 for unknown routes are not recorded (scanner noise).
+AUDITED_DENIALS = {401, 403, 404, 409}
+
+
+def _record_denial(request: Request, exc: HTTPException) -> None:
+    try:
+        _write_denial(request, exc)
+    except Exception:
+        # The request is refused either way; an audit write failure must
+        # not turn a 401/403 into a 500. It is logged, not swallowed.
+        logger.exception("failed to audit denied request %s %s", request.method, request.url.path)
+
+
+def _write_denial(request: Request, exc: HTTPException) -> None:
+    auth = getattr(request.state, "auth", None)
+    claimed = getattr(request.state, "claimed", None)
+    if auth is not None:
+        actor, who = auth["tenant_id"], audit.principal(auth)
+    elif claimed is not None:
+        # A refused agent key: file it under the tenant the key names, so
+        # that tenant sees a suspended/unregistered agent still trying.
+        actor = claimed["tenant_id"]
+        who = {"kind": "refused_agent_key", "agent_id": claimed["agent_id"]}
+    else:
+        actor, who = "unauthenticated", {"kind": None, "agent_id": None}
+    audit.record(
+        actor,
+        "request.denied",
+        request.url.path,
+        {
+            "status": exc.status_code,
+            "method": request.method,
+            "path": request.url.path,
+            "reason": exc.detail if isinstance(exc.detail, str) else "denied",
+            "principal": who,
+        },
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def audited_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if isinstance(exc, HTTPException) and exc.status_code in AUDITED_DENIALS:
+        await run_in_threadpool(_record_denial, request, exc)
+    return await http_exception_handler(request, exc)
 
 
 @app.get("/health")
@@ -59,7 +114,10 @@ def create_agent(body: AgentIn, auth=Depends(require_tenant_auth)):
         )
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    audit.record(auth["tenant_id"], "agent.register", body.agent_id, {"name": body.name})
+    audit.record(
+        auth["tenant_id"], "agent.register", body.agent_id,
+        {"name": body.name, "principal": audit.principal(auth)},
+    )
     return agent
 
 
@@ -74,7 +132,7 @@ def approve_agent(agent_id: str, auth=Depends(require_tenant_auth)):
         agent = registry.approve_agent(auth["tenant_id"], agent_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    audit.record(auth["tenant_id"], "agent.approve", agent_id, {})
+    audit.record(auth["tenant_id"], "agent.approve", agent_id, {"principal": audit.principal(auth)})
     return agent
 
 
@@ -84,7 +142,7 @@ def suspend_agent(agent_id: str, auth=Depends(require_tenant_auth)):
         agent = registry.suspend_agent(auth["tenant_id"], agent_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    audit.record(auth["tenant_id"], "agent.suspend", agent_id, {})
+    audit.record(auth["tenant_id"], "agent.suspend", agent_id, {"principal": audit.principal(auth)})
     return agent
 
 
@@ -108,7 +166,13 @@ def create_task(body: TaskIn, auth=Depends(require_api_key)):
         auth["tenant_id"],
         "task.create",
         task["task_id"],
-        {"agent_id": body.agent_id, "created_by_agent_id": auth.get("agent_id")},
+        {
+            "task_id": task["task_id"],
+            "agent_id": body.agent_id,
+            "created_by_agent_id": auth.get("agent_id"),
+            "trace_id": task["trace_id"],
+            "principal": audit.principal(auth),
+        },
     )
     return task
 
@@ -150,13 +214,29 @@ def set_task_status(task_id: str, body: StatusIn, auth=Depends(require_api_key))
             detail="this credential may not move this task to that status",
         )
     try:
-        task = orchestration.set_status(task_id, body.status)
+        previous, task = orchestration.transition(task_id, body.status)
     except orchestration.TransitionConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    audit.record(auth["tenant_id"], "task.status", task_id, {"status": body.status})
+    audit.record(
+        auth["tenant_id"],
+        "task.status",
+        task_id,
+        {
+            "task_id": task_id,
+            "from": previous,
+            "to": task["status"],
+            "trace_id": task.get("trace_id"),
+            "principal": audit.principal(auth),
+        },
+    )
     return task
+
+
+# Opaque ids (UUIDs, W3C trace ids, message ids): bounded, no spaces or
+# separators that could be confused with the idempotency-key format.
+TRACE_ID_PATTERN = r"^[A-Za-z0-9._-]{1,128}$"
 
 
 class MessageIn(BaseModel):
@@ -170,6 +250,11 @@ class MessageIn(BaseModel):
     # Stable client key for retries. When set, a timed-out retry with the
     # same key is a no-op instead of a second message.
     idempotency_key: str | None = None
+    # T09. trace_id: defaults to the task's trace; set it only to propagate
+    # a trace that started outside the Hub. correlation_id: for a reply,
+    # the message_id being answered; defaults to the message's own id.
+    trace_id: str | None = Field(default=None, pattern=TRACE_ID_PATTERN)
+    correlation_id: str | None = Field(default=None, pattern=TRACE_ID_PATTERN)
 
 
 @app.post("/tasks/{task_id}/messages")
@@ -199,12 +284,27 @@ def send_message(task_id: str, body: MessageIn, auth=Depends(require_api_key)):
         event_type=body.event_type,
         payload=body.payload,
         client_idempotency_key=body.idempotency_key,
+        trace_id=body.trace_id or task.get("trace_id"),
+        correlation_id=body.correlation_id,
     )
+    stored_msg = result["message"]
+    # On a duplicate, stored_msg is the original message, so the duplicate
+    # entry points at the message it was folded into.
     audit.record(
         auth["tenant_id"],
         "message.send" if result["stored"] else "message.duplicate",
         task_id,
-        {"event_type": body.event_type, "stored": result["stored"]},
+        {
+            "task_id": task_id,
+            "message_id": stored_msg["message_id"],
+            "event_type": body.event_type,
+            "sender_agent_id": stored_msg["sender_agent_id"],
+            "recipient_agent_id": stored_msg["recipient_agent_id"],
+            "trace_id": stored_msg.get("trace_id"),
+            "correlation_id": stored_msg.get("correlation_id"),
+            "stored": result["stored"],
+            "principal": audit.principal(auth),
+        },
     )
     return {"stored": result["stored"], "message": result["message"]}
 
@@ -259,9 +359,23 @@ def receipt_message(task_id: str, message_id: str, body: ReceiptIn, auth=Depends
         auth["tenant_id"],
         "message.receipt" if result["stored"] else "message.receipt.duplicate",
         task_id,
-        {"message_id": message_id, "stored": result["stored"]},
+        {
+            "task_id": task_id,
+            "message_id": message_id,
+            "recipient_agent_id": recipient_id,
+            "stored": result["stored"],
+            "principal": audit.principal(auth),
+        },
     )
     return result
+
+
+@app.get("/tasks/{task_id}/correlation")
+def task_correlation(task_id: str, auth=Depends(require_api_key)):
+    """T09: does every message, receipt and the current status of this task
+    trace back to this tenant's audit entries? See observability.correlate_task."""
+    _get_task_for_tenant(task_id, auth["tenant_id"])
+    return audit.correlate_task(auth["tenant_id"], task_id)
 
 
 @app.get("/audit")

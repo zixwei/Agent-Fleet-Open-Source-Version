@@ -31,6 +31,7 @@ def build_envelope(
     protocol: str = "fleet",
     protocol_version: str = "1.0",
     client_idempotency_key: str | None = None,
+    trace_id: str | None = None,
 ) -> dict:
     message_id = str(uuid.uuid4())
     event_id = str(uuid.uuid4())
@@ -56,7 +57,9 @@ def build_envelope(
         "correlation_id": correlation_id or message_id,
         "idempotency_key": idem,
         "payload_reference": None,
-        "trace_id": str(uuid.uuid4()),
+        # T09: the caller passes the task's trace (or one it propagates);
+        # a fresh id is only a fallback for callers without a task trace.
+        "trace_id": trace_id or str(uuid.uuid4()),
         "signature": None,
         "payload": payload,
     }

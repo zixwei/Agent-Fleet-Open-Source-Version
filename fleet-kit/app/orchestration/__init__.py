@@ -47,6 +47,8 @@ def create_task(
     db.insert_task(
         task_id, tenant_id, agent_id, title, "submitted", now, now,
         created_by_agent_id=created_by_agent_id,
+        # T09: one trace per task; messages on the task default to it.
+        trace_id=str(uuid.uuid4()),
     )
     return get_task(task_id)
 
@@ -72,6 +74,12 @@ def can_request_status(task: dict, auth: dict, status: str) -> bool:
 
 
 def set_status(task_id: str, status: str) -> dict:
+    return transition(task_id, status)[1]
+
+
+def transition(task_id: str, status: str) -> tuple[str, dict]:
+    """Like set_status, but also returns the status the compare-and-set
+    actually moved from (what the audit entry must record as "from")."""
     task = db.get_task(task_id)
     if not task:
         raise ValueError(f"task {task_id} not found")
@@ -83,4 +91,4 @@ def set_status(task_id: str, status: str) -> dict:
         raise TransitionConflict(
             f"task {task_id} changed concurrently (was {current}); re-read and retry"
         )
-    return get_task(task_id)
+    return current, get_task(task_id)

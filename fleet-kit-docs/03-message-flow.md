@@ -103,6 +103,14 @@ POST /tasks/{task_id}/status
 - 增量校验：`GET /audit/verify?after_seq=<head_seq>&anchor_hash=<head_hash>`。锚点必须由调用方提供（取自上一次成功校验），**不从日志里读**，否则被改写的日志可以自证清白。
 - 检查点要存到 Hub 写不到的地方。hash 链本身发现不了「最新几条被整段删掉」；拿保存的检查点去比，才能发现（日志比检查点短 → `ok: false`）。
 
+### 关联（T09）
+
+- 每个任务创建时生成 `trace_id`；任务上的消息默认沿用它（调用方只在传播外部链路时才自带 `trace_id`）。回复时用 `correlation_id` 填被回复的 `message_id`。
+- 消息表持久化 `trace_id`、`correlation_id`、`context_id`、`protocol`、`protocol_version`。
+- 审计 `actor` 仍是租户（`GET /audit` 按它隔离）；真正动手的凭证记在 `detail.principal = {kind, agent_id}`。消息、回执审计都带 `message_id`、`trace_id`；状态变更记 `from` / `to`。这些字段都在被 hash 的 `detail` 里。
+- 被拒的请求（`401/403/404/409`）记为 `request.denied`，记在调用方租户名下；被拒的 Agent Key 记在它所属的租户名下（`principal.kind = refused_agent_key`）；未认证的记在 `unauthenticated` 名下。**提交的 Key 本身不落库。** 不存在的路由不记。
+- `GET /tasks/{task_id}/correlation`：逐条核对该任务的消息、回执、当前状态能否对上审计记录，返回 `messages_attributed / messages_total`、`receipts_audited / receipts_total` 和 `problems` 清单；全部对上才 `ok: true`。
+
 ## 时序简图
 
 ```

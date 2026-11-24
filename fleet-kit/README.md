@@ -24,7 +24,7 @@ chmod +x demo.sh
 
 `create_task` · `post_message` · `get_task` · `list_messages` · `receipt` · `set_status`
 
-身份只来自 `FLEET_AGENT_API_KEY`，不信任消息正文自称。`post_message` 支持 `idempotency_key`，超时重试复用同一个值即可。执行方推进自己的任务，创建方只能取消。
+身份只来自 `FLEET_AGENT_API_KEY`，不信任消息正文自称。`post_message` 支持 `idempotency_key`，超时重试复用同一个值即可。执行方推进自己的任务，创建方只能取消。回复时用 `correlation_id` 指向被回复的消息；`GET /tasks/{id}/correlation` 核对一个任务的消息、回执、状态与审计是否全部对得上（T09）。
 
 ## 非目标（1.0 不做）
 

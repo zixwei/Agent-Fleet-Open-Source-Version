@@ -3,6 +3,13 @@
 Append-only log with a hash chain (plan v0.2.6): each entry records the hash
 of the previous entry, so tampering with history breaks the chain. A hash
 chain alone is not tamper-proof; it is evidence, not a guarantee.
+
+T09 (audit record correlation): correlation fields live inside `detail`,
+which is part of the entry hash, so they are integrity-protected like the
+rest of the entry. `actor` stays the tenant id (it scopes GET /audit); the
+acting credential is detail["principal"] = {"kind": "tenant"|"agent",
+"agent_id"}. correlate_task() checks one task's messages, receipts and
+status against its audit entries.
 """
 import hashlib
 import json
@@ -105,3 +112,98 @@ def verify_chain(after_seq: int = 0, anchor_hash: str | None = None, batch: int 
             last_seq = e["seq"]
             checked += 1
     return {"ok": True, "checked": checked, "head_seq": last_seq, "head_hash": prev}
+
+
+def principal(auth: dict) -> dict:
+    """The acting credential as recorded in audit detail (never the key)."""
+    return {"kind": auth.get("auth_kind"), "agent_id": auth.get("agent_id")}
+
+
+def correlate_task(tenant_id: str, task_id: str) -> dict:
+    """T09 check for one task: can every message, receipt and the current
+    status be traced back to audit entries of this tenant?
+
+    A message counts as attributed (plan v0.2.6 §21.3 B) when it has a
+    task_id, message_id and trace_id AND a message.send audit entry with the
+    same message_id and trace_id, recorded under a principal that matches
+    its sender when the sender used an agent key. Receipts need a matching
+    message.receipt entry by the recipient agent. The task needs a
+    task.create entry, and its status must equal the last audited
+    transition. Caller must have checked that the task belongs to tenant_id.
+    """
+    task = db.get_task(task_id)
+    if task is None:
+        raise ValueError("task not found")
+    messages = db.list_messages(task_id)
+    entries = db.list_audit_for_target(actor=tenant_id, target=task_id)
+
+    sends, receipts = {}, {}
+    created = False
+    last_status = None
+    for e in entries:
+        d, action = e["detail"], e["action"]
+        if action == "task.create":
+            created = True
+        elif action == "message.send":
+            sends.setdefault(d.get("message_id"), d)
+        elif action == "message.receipt":
+            receipts.setdefault(d.get("message_id"), d)
+        elif action == "task.status":
+            last_status = d.get("to", d.get("status"))
+
+    problems = []
+    if not task.get("trace_id"):
+        problems.append({"task_id": task_id, "missing": ["task.trace_id"]})
+    if not created:
+        problems.append({"task_id": task_id, "missing": ["audit.task.create"]})
+    expected = last_status or "submitted"
+    if task["status"] != expected:
+        problems.append({
+            "task_id": task_id,
+            "missing": [f"audit.task.status (status {task['status']}, last audited {expected})"],
+        })
+
+    attributed = on_task_trace = receipts_total = receipts_audited = 0
+    for m in messages:
+        missing = [f"message.{f}" for f in ("task_id", "message_id", "trace_id") if not m.get(f)]
+        sent = sends.get(m["message_id"])
+        if sent is None:
+            missing.append("audit.message.send")
+        else:
+            p = sent.get("principal")
+            if not p:
+                missing.append("audit.principal")
+            elif p.get("kind") == "agent" and p.get("agent_id") != m["sender_agent_id"]:
+                missing.append("audit.principal_is_not_sender")
+            if sent.get("trace_id") != m.get("trace_id"):
+                missing.append("audit.trace_id_mismatch")
+        if not missing:
+            attributed += 1
+        if m.get("trace_id") and m.get("trace_id") == task.get("trace_id"):
+            on_task_trace += 1
+        receipt = m.get("receipt")
+        if receipt:
+            receipts_total += 1
+            r = receipts.get(m["message_id"])
+            if r is None:
+                missing.append("audit.message.receipt")
+            elif (r.get("principal") or {}).get("agent_id") != receipt["recipient_agent_id"]:
+                missing.append("audit.receipt_principal_is_not_recipient")
+            else:
+                receipts_audited += 1
+        if missing:
+            problems.append({"message_id": m["message_id"], "missing": missing})
+
+    return {
+        "ok": not problems,
+        "task_id": task_id,
+        "trace_id": task.get("trace_id"),
+        "status": task["status"],
+        "messages_total": len(messages),
+        "messages_attributed": attributed,
+        "messages_on_task_trace": on_task_trace,
+        "receipts_total": receipts_total,
+        "receipts_audited": receipts_audited,
+        "audit_entries": len(entries),
+        "problems": problems,
+    }

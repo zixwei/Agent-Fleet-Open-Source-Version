@@ -140,9 +140,11 @@ def main() -> None:
             "recipient_agent_id": "orchestrator",
             "event_type": "task.result",
             "payload": {"result": "ok"},
+            "correlation_id": message_id,
         },
     )
     must(code == 200 and reply.get("stored") is True, f"worker reply {reply}")
+    must(reply["message"]["correlation_id"] == message_id, "reply correlates to the assign message")
     reply_id = reply["message"]["message_id"]
     code, _ = req(
         "POST",
@@ -166,6 +168,17 @@ def main() -> None:
     code, msgs = req("GET", f"/tasks/{task_id}/messages", TENANT_KEY)
     # assign + keyed note (once, despite the retry) + result = 3
     must(code == 200 and isinstance(msgs, list) and len(msgs) == 3, f"list_messages n={len(msgs) if isinstance(msgs, list) else msgs}")
+
+    # T09: every message carries the task's trace, and every message,
+    # receipt and the final status trace back to audit entries.
+    must(all(m.get("trace_id") == task["trace_id"] for m in msgs), "messages carry the task trace_id")
+    code, corr = req("GET", f"/tasks/{task_id}/correlation", TENANT_KEY)
+    must(
+        code == 200 and corr.get("ok") is True
+        and corr["messages_attributed"] == corr["messages_total"] == 3
+        and corr["receipts_audited"] == corr["receipts_total"] == 2,
+        f"T09 correlation {corr}",
+    )
 
     code, verify = req("GET", "/audit/verify", TENANT_KEY)
     must(code == 200 and verify.get("ok") is True, f"audit verify (whole chain) {verify}")
