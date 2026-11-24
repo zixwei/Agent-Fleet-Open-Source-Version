@@ -137,12 +137,34 @@ def set_task_status(task_id: str, body: StatusIn, auth=Depends(require_api_key))
 
 class MessageIn(BaseModel):
     sender_agent_id: str = Field(min_length=1)
-    # T01 fix: the caller may name the recipient. A reply from the task's
-    # agent goes back to the other party, not to itself. When omitted, the
-    # recipient defaults to the task's agent (previous behaviour).
+    # T01 fix: the caller may name the recipient explicitly. When omitted,
+    # routing is implicit: a message from anyone other than the task's
+    # agent goes to the task's agent (previous behaviour); a reply from
+    # the task's agent goes back to the other party on the task (the
+    # sender of the most recent message that did not come from the task's
+    # agent). Without a prior inbound message there is no other party, so
+    # the task's agent stays the recipient. An explicit recipient always
+    # wins over the implicit rule.
     recipient_agent_id: str | None = None
     event_type: str = Field(min_length=1)
     payload: dict = {}
+
+
+def _implicit_recipient(task_id: str, sender_agent_id: str, task_agent_id: str) -> str:
+    """Implicit reply routing (T01): the other party on the task.
+
+    A message from anyone other than the task's agent goes to the task's
+    agent. A reply from the task's agent goes back to the sender of the
+    most recent message on this task that did not come from the task's
+    agent (the requester). With no prior inbound message there is no
+    other party, so the task's agent stays the recipient.
+    """
+    if sender_agent_id != task_agent_id:
+        return task_agent_id
+    for message in reversed(bus.list_for_task(task_id)):
+        if message["sender_agent_id"] != task_agent_id:
+            return message["sender_agent_id"]
+    return task_agent_id
 
 
 @app.post("/tasks/{task_id}/messages")
@@ -159,7 +181,9 @@ def send_message(task_id: str, body: MessageIn, auth=Depends(require_api_key)):
         raise HTTPException(
             status_code=400, detail=f"sender agent {body.sender_agent_id} not found"
         )
-    recipient_id = body.recipient_agent_id or task["agent_id"]
+    recipient_id = body.recipient_agent_id or _implicit_recipient(
+        task_id, body.sender_agent_id, task["agent_id"]
+    )
     if not registry.get_agent(recipient_id):
         raise HTTPException(
             status_code=400, detail=f"recipient agent {recipient_id} not found"

@@ -116,6 +116,38 @@ def test_t01_recipient_defaults_to_task_agent():
     assert r.json()["message"]["recipient_agent_id"] == "agent-b"
 
 
+def test_t01_reply_without_recipient_goes_to_other_party():
+    """Implicit routing: B replying with no recipient field goes to A.
+
+    The acceptance runner sends replies without recipient_agent_id, so
+    the hub must route a reply from the task's agent back to the other
+    party (the requester), not to the task's agent itself.
+    """
+    from app.main import app
+
+    client = TestClient(app)
+    _make_agent(client, "agent-a", HEADERS_A)
+    _make_agent(client, "agent-b", HEADERS_A)
+    r = client.post("/tasks", json={"agent_id": "agent-b", "title": "implicit"}, headers=HEADERS_A)
+    task_id = r.json()["task_id"]
+    # A -> B with no recipient field: recipient is the task's agent.
+    r = client.post(
+        f"/tasks/{task_id}/messages",
+        json={"sender_agent_id": "agent-a", "event_type": "task.request", "payload": {}},
+        headers=HEADERS_A,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["message"]["recipient_agent_id"] == "agent-b"
+    # B replies 10 times with no recipient field: every reply goes to A.
+    for _ in range(10):
+        r = client.post(
+            f"/tasks/{task_id}/messages",
+            json={"sender_agent_id": "agent-b", "event_type": "task.reply", "payload": {}},
+            headers=HEADERS_A,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["message"]["recipient_agent_id"] == "agent-a"
+
 def test_t01_unknown_sender_or_recipient_rejected():
     """Unknown sender or recipient is a 400, not a silent misroute."""
     from app.main import app

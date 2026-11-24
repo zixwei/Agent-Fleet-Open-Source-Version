@@ -66,13 +66,16 @@ curl -s -X POST localhost:8000/tasks -H "X-API-Key: $KEY" \
   404. Sending with an agent credential binds the sender to that agent
   (403 on mismatch). Verified live by two independent agent processes,
   each with its own credential, exchanging 100 rounds over HTTP:
-  200/200 messages, 200/200 receipts.
+  200/200 messages, 200/200 receipts (reproduced by
+  `prototype/tests/t01_live_two_process.py`: 100/100 rounds PASS,
+  audit chain verified).
 - **Audit chain under concurrency** — `record()` read the previous hash
   and inserted the entry in two separate connections, so concurrent
   appends forked the chain (`/audit/verify` broke at seq 59 in the
   two-process test). The append is now one BEGIN IMMEDIATE transaction
   (read prev + insert), with a regression test hammering it from 8
   threads x 25 appends.
+- **T01 delivery receipts** — `POST
   /tasks/{id}/messages/{message_id}/receipt` with
   `{"recipient_agent_id": "..."}` lets the receiving agent confirm
   delivery. Routing metadata only proves the hub stored the message; the
@@ -83,10 +86,14 @@ curl -s -X POST localhost:8000/tasks -H "X-API-Key: $KEY" \
   /tasks/{id}/messages` carries each message's `receipt` (null if none).
   Backed by a `message_receipts` table; receipts are audit-logged as
   `message.receipt` (duplicates as `message.receipt.duplicate`).
+- **T01 reply routing** — `POST /tasks/{id}/messages` takes
   an optional `recipient_agent_id`. A reply from the task's agent can now
   be routed back to the other party; previously the recipient was hardcoded
   to the task's agent, so every reply went to the sender itself. Omitting
-  the field keeps the old default (the task's agent). Sender and recipient
+  the field routes implicitly: a message from anyone other than the task's
+  agent goes to the task's agent, and a reply from the task's agent goes
+  back to the other party on the task (the sender of the most recent
+  message not from the task's agent). Sender and recipient
   must both be registered agents (400 otherwise).
 - **T08 cross-tenant isolation** — every task object endpoint (`GET`
   `/tasks/{id}`, status, messages) checks the task belongs to the caller's
