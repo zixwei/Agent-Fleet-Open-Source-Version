@@ -58,6 +58,7 @@ CI：`.github/workflows/fleet-kit.yml` 在改动 `fleet-kit/` 的 PR 上跑单�
 | 跨租户 | 另一租户 Key → 404 |
 | 审计 | `/audit/verify` 校验整条链 → `ok: true`（超过 1000 条且有篡改的情况见 `tests/test_audit_verify.py`） |
 | 审计关联（T09） | `GET /tasks/{id}/correlation` → `ok: true`，3/3 条消息、2/2 个回执对得上审计；被拒请求有 `request.denied` 记录（见 `tests/test_t09_correlation.py`） |
+| 审计防刷 | 300 次错误 Key 只产生 1 条单独记录 + 窗口结束后 1 条汇总；链校验仍通过（见 `tests/test_denial_flood.py`） |
 | MCP 同账本 | `mcp_http_parity` 或 Cursor 工具留下同一 `task_id` |
 | 口径 | README/`protocol` 为 `fleet`，无「已兼容 A2A」 |
 

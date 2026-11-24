@@ -28,10 +28,12 @@ from fastapi.exception_handlers import http_exception_handler
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
 from app import config
 from app.identity import require_agent_auth, require_api_key, require_tenant_auth
 from app import observability as audit
+from app.observability.denials import DenialLimiter
 from app import registry
 from app.messaging.bus import bus
 from app import orchestration
@@ -46,10 +48,67 @@ def startup():
     db.init_db()
 
 
+@app.on_event("shutdown")
+def shutdown():
+    # Close the current denial window so its counts reach the audit log.
+    _flush_denials(force=True)
+
+
 # T09 / whitepaper §8.3 "security anomalies": requests our code refuses are
 # audited. Only fastapi.HTTPException raised by this app counts; Starlette's
 # own 404/405 for unknown routes are not recorded (scanner noise).
 AUDITED_DENIALS = {401, 403, 404, 409}
+
+# Flood protection: only the first few denials per source/principal and
+# window get their own entry; the rest are counted into summaries. See
+# app/observability/denials.py for the bound.
+denial_limiter = DenialLimiter(
+    window_seconds=config.DENIAL_WINDOW_SECONDS,
+    per_source=config.DENIAL_PER_SOURCE,
+    per_principal=config.DENIAL_PER_PRINCIPAL,
+    max_sources=config.DENIAL_MAX_SOURCES,
+    max_individual=config.DENIAL_MAX_INDIVIDUAL,
+)
+
+# Path and reason are partly caller-controlled (path parameters); keep the
+# individual entries bounded in size.
+MAX_LOGGED_TEXT = 256
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= MAX_LOGGED_TEXT else text[:MAX_LOGGED_TEXT]
+
+
+def _route_template(request: Request) -> str:
+    """Route pattern such as /tasks/{task_id}: a bounded set of values, unlike
+    the raw path, so it is safe to count by."""
+    route = request.scope.get("route")
+    if route is not None and getattr(route, "path", None):
+        return route.path
+    for candidate in request.app.router.routes:
+        match, _ = candidate.matches(request.scope)
+        if match == Match.FULL:
+            return getattr(candidate, "path", "<unmatched>")
+    return "<unmatched>"
+
+
+def _source(request: Request) -> str:
+    # The direct peer. Behind a reverse proxy this is the proxy for every
+    # client; X-Forwarded-For is not trusted (spoofable). The bound holds
+    # either way, only the per-source detail gets coarser.
+    return request.client.host if request.client else "unknown"
+
+
+def _write_summaries(summaries: list) -> None:
+    for s in summaries:
+        audit.record(s["actor"], "request.denied.summary", s["target"], s["detail"])
+
+
+def _flush_denials(force: bool = False) -> None:
+    try:
+        _write_summaries(denial_limiter.flush(force=force))
+    except Exception:
+        logger.exception("failed to write denial summaries")
 
 
 def _record_denial(request: Request, exc: HTTPException) -> None:
@@ -73,18 +132,29 @@ def _write_denial(request: Request, exc: HTTPException) -> None:
         who = {"kind": "refused_agent_key", "agent_id": claimed["agent_id"]}
     else:
         actor, who = "unauthenticated", {"kind": None, "agent_id": None}
-    audit.record(
-        actor,
-        "request.denied",
-        request.url.path,
-        {
-            "status": exc.status_code,
-            "method": request.method,
-            "path": request.url.path,
-            "reason": exc.detail if isinstance(exc.detail, str) else "denied",
-            "principal": who,
-        },
+    source = _source(request)
+    write, summaries = denial_limiter.decide(
+        actor=actor,
+        principal=who,
+        source=source,
+        status=exc.status_code,
+        route=_route_template(request),
     )
+    _write_summaries(summaries)
+    if not write:
+        return
+    path = request.url.path
+    detail = {
+        "status": exc.status_code,
+        "method": request.method,
+        "path": _clip(path),
+        "reason": _clip(exc.detail) if isinstance(exc.detail, str) else "denied",
+        "principal": who,
+        "source": source,
+    }
+    if len(path) > MAX_LOGGED_TEXT:
+        detail["path_truncated"] = True
+    audit.record(actor, "request.denied", _clip(path), detail)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -382,6 +452,7 @@ def task_correlation(task_id: str, auth=Depends(require_api_key)):
 def list_audit(limit: int = 100, auth=Depends(require_api_key)):
     # T08: audit entries are scoped to the caller's tenant (actor is the
     # tenant id). The chain itself is still verified whole in /audit/verify.
+    _flush_denials()  # summaries of closed denial windows show up right away
     return audit.list_audit(limit, actor=auth["tenant_id"])
 
 
@@ -393,6 +464,7 @@ def verify_audit(
 ):
     """Whole chain by default. For an incremental check pass after_seq plus
     the head_hash you kept from an earlier run (never read back from the log)."""
+    _flush_denials()
     try:
         return audit.verify_chain(after_seq=after_seq, anchor_hash=anchor_hash)
     except ValueError as e:

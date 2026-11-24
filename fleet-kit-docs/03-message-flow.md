@@ -108,7 +108,18 @@ POST /tasks/{task_id}/status
 - 每个任务创建时生成 `trace_id`；任务上的消息默认沿用它（调用方只在传播外部链路时才自带 `trace_id`）。回复时用 `correlation_id` 填被回复的 `message_id`。
 - 消息表持久化 `trace_id`、`correlation_id`、`context_id`、`protocol`、`protocol_version`。
 - 审计 `actor` 仍是租户（`GET /audit` 按它隔离）；真正动手的凭证记在 `detail.principal = {kind, agent_id}`。消息、回执审计都带 `message_id`、`trace_id`；状态变更记 `from` / `to`。这些字段都在被 hash 的 `detail` 里。
-- 被拒的请求（`401/403/404/409`）记为 `request.denied`，记在调用方租户名下；被拒的 Agent Key 记在它所属的租户名下（`principal.kind = refused_agent_key`）；未认证的记在 `unauthenticated` 名下。**提交的 Key 本身不落库。** 不存在的路由不记。
+- 被拒的请求（`401/403/404/409`）记为 `request.denied`，记在调用方租户名下；被拒的 Agent Key 记在它所属的租户名下（`principal.kind = refused_agent_key`）；未认证的记在 `unauthenticated` 名下。**提交的 Key 本身不落库。** 不存在的路由不记。`path` / `reason` 超过 256 字符截断（`path_truncated: true`）。
+- **防刷（`app/observability/denials.py`）**：按固定时间窗口计数。每个窗口里，每个未认证来源只单独记前 `AI_FLEET_DENIAL_PER_SOURCE` 条，每个凭证（租户、Agent、被拒的 Agent Key）只单独记前 `AI_FLEET_DENIAL_PER_PRINCIPAL` 条，全部加起来不超过 `AI_FLEET_DENIAL_MAX_INDIVIDUAL` 条；其余只计数，窗口结束后写成一条 `request.denied.summary`（数量、状态码分布、路由模板分布、来源）。未认证来源最多分 `AI_FLEET_DENIAL_MAX_SOURCES` 个桶，再多的来源进同一个溢出桶。所以不管请求多少、来源怎么伪造，每个窗口的审计写入都有上限。汇总在下一次被拒、`GET /audit`、`GET /audit/verify` 或进程关闭时写入。
+
+  | 环境变量 | 默认 | 含义 |
+  | --- | --- | --- |
+  | `AI_FLEET_DENIAL_WINDOW_SECONDS` | 60 | 窗口长度（秒） |
+  | `AI_FLEET_DENIAL_PER_SOURCE` | 1 | 每个未认证来源每窗口单独记几条 |
+  | `AI_FLEET_DENIAL_PER_PRINCIPAL` | 5 | 每个凭证每窗口单独记几条 |
+  | `AI_FLEET_DENIAL_MAX_SOURCES` | 20 | 每窗口最多跟踪几个未认证来源 |
+  | `AI_FLEET_DENIAL_MAX_INDIVIDUAL` | 100 | 每窗口单独记录的总上限 |
+
+  限制：计数在内存里，进程崩溃会丢当前窗口未写出的计数（单条记录不受影响）；多进程部署时每个进程各算一份；来源取直连地址，不信任 `X-Forwarded-For`，在反向代理后面所有人会落到同一个来源桶（上限照样成立，只是来源变粗）。这里只限审计写入，**不拒绝请求**（不返回 429）。
 - `GET /tasks/{task_id}/correlation`：逐条核对该任务的消息、回执、当前状态能否对上审计记录，返回 `messages_attributed / messages_total`、`receipts_audited / receipts_total` 和 `problems` 清单；全部对上才 `ok: true`。
 
 ## 时序简图
