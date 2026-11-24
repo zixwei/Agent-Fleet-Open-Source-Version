@@ -253,7 +253,15 @@ def test_t08_cross_tenant_task_isolation():
             for name, method, url, kwargs in probe_calls:
                 status, body = _t08_probe(client, method, url, HEADERS_A, **kwargs)
                 safe = status in (403, 404)
-                no_leak = title_marker not in body and payload_marker not in body
+                # No-leak assertion (Cue #lzxrrg): the body must contain no
+                # tenant-B data at all: not the unique title/payload markers,
+                # and not the task id, message id, agent id (agent-b) or
+                # tenant id (tenant-b) either.
+                tenant_b_markers = (
+                    title_marker, payload_marker, task_id, message_id,
+                    "tenant-b", "agent-b",
+                )
+                no_leak = all(m not in body for m in tenant_b_markers)
                 probes.append({
                     "probe": name,
                     "http_status": status,
