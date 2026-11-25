@@ -5,10 +5,14 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 export PATH="${HOME}/.local/bin:${PATH}"
-export FLEET_API_KEY="${FLEET_API_KEY:-fleet-demo-tenant}"
-export FLEET_OTHER_TENANT_KEY="${FLEET_OTHER_TENANT_KEY:-fleet-demo-other}"
-export FLEET_AGENT_A_KEY="${FLEET_AGENT_A_KEY:-fleet-demo-orch}"
-export FLEET_AGENT_B_KEY="${FLEET_AGENT_B_KEY:-fleet-demo-worker}"
+# Fresh random demo keys on every run: no guessable literals (B2). Exports the
+# client keys FLEET_API_KEY, FLEET_OTHER_TENANT_KEY, FLEET_AGENT_A_KEY,
+# FLEET_AGENT_B_KEY (a preset value of >= 24 chars is kept) and the Hub side
+# AI_FLEET_API_KEY / AI_FLEET_TENANT_API_KEYS / AI_FLEET_AGENT_API_KEYS, which
+# hold hashes only. Stdlib only, so it runs before pip install.
+DEMO_KEYS="$(python3 scripts/gen_keys.py demo --shell)"
+eval "$DEMO_KEYS"
+unset DEMO_KEYS
 PORT="${FLEET_PORT:-8765}"
 # Keep URL in sync with the listening port unless the caller set both.
 if [[ -z "${FLEET_HUB_URL:-}" ]]; then
@@ -18,23 +22,6 @@ DB_PATH="${ROOT}/.demo-fleet.db"
 rm -f "$DB_PATH"
 
 export AI_FLEET_DB="sqlite:///${DB_PATH}"
-export AI_FLEET_API_KEY="$FLEET_API_KEY"
-export AI_FLEET_TENANT_API_KEYS=$(python3 - <<PY
-import json, os
-print(json.dumps({
-  os.environ["FLEET_API_KEY"]: "demo-tenant",
-  os.environ["FLEET_OTHER_TENANT_KEY"]: "other-tenant",
-}))
-PY
-)
-export AI_FLEET_AGENT_API_KEYS=$(python3 - <<PY
-import json, os
-print(json.dumps({
-  os.environ["FLEET_AGENT_A_KEY"]: {"agent_id": "orchestrator", "tenant_id": "demo-tenant"},
-  os.environ["FLEET_AGENT_B_KEY"]: {"agent_id": "worker", "tenant_id": "demo-tenant"},
-}))
-PY
-)
 
 # CI installs dependencies itself and sets FLEET_SKIP_PIP=1.
 if [[ "${FLEET_SKIP_PIP:-0}" != "1" ]]; then

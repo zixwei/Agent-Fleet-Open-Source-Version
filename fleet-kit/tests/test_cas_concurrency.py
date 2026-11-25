@@ -16,6 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 
+from app.identity.keyhash import hash_key_map
+
 ROUNDS = 40
 
 
@@ -113,7 +115,7 @@ def test_lost_race_is_http_409(monkeypatch):
     """A lost compare-and-set surfaces as 409 Conflict, not 400."""
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps({"key-a": "tenant-a"}))
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map({"key-a": "tenant-a"})))
     from app.main import app
     from app import storage
 

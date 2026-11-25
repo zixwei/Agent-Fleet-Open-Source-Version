@@ -11,7 +11,7 @@ chmod +x demo.sh
 `demo.sh` 会：
 
 1. 装依赖  
-2. 配置演示用租户 Key / 两个 Agent Key / 另一租户 Key  
+2. 用 `scripts/gen_keys.py demo --shell` 现场生成**随机**的演示租户 Key / 两个 Agent Key / 另一租户 Key（每次运行都不同，没有可猜的字面量）；Hub 只拿到它们的哈希  
 3. 在 `FLEET_PORT`（默认 8765）起 Hub；**自动把 `FLEET_HUB_URL` 对齐到该端口**  
 4. 跑 `scripts/demo_two_agents.py`（注册→任务→消息→回执→完成→跨租户 404→审计）  
 5. 跑 `scripts/mcp_http_parity.py`（MCP 工具函数打同一 Hub）  
@@ -31,14 +31,15 @@ CI：`.github/workflows/fleet-kit.yml` 在改动 `fleet-kit/` 的 PR 上跑单�
 1. 先保证 Hub 在跑（可改 demo 不杀进程，或手动）：
    ```bash
    cd fleet-kit
-   export AI_FLEET_API_KEY=fleet-demo-tenant
-   # 按需导出 AI_FLEET_TENANT_API_KEYS / AI_FLEET_AGENT_API_KEYS（与 demo.sh 一致）
+   # 新 checkout 先生成一套全新的随机演示 Key（两个文件都是 0600、已 gitignore）
+   python3 scripts/gen_keys.py demo --env-file .demo-keys.env --mcp-host mcp-host.json
+   set -a; . ./.demo-keys.env; set +a   # Hub 侧只用其中的 AI_FLEET_*（哈希）
    python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8765
    ```
-2. Cursor → Settings → MCP，粘贴并改路径：
-   - 参考 [`../fleet-kit/mcp-host.example.json`](../fleet-kit/mcp-host.example.json)
-   - `/ABS/PATH/TO/fleet-kit` → 本机绝对路径  
+2. Cursor → Settings → MCP，粘贴生成的 `mcp-host.json`（路径与两把 Agent Key 已填好）：
+   - 模板是 [`../fleet-kit/mcp-host.example.json`](../fleet-kit/mcp-host.example.json)，里面只有 `${FLEET_AGENT_A_KEY}` / `${FLEET_AGENT_B_KEY}` 占位符，不是可用的 Key
    - `FLEET_HUB_URL` → `http://127.0.0.1:8765`
+   - 重新生成 Key 后要用新的 `.demo-keys.env` 重启 Hub
 3. 重载 MCP，确认出现 `create_task`、`post_message` 等工具  
 4. 在对话里让 Cursor 调用一次 `create_task` 或 `get_task`  
 5. 用返回的 `task_id` 对照 `curl -H "X-API-Key: …" http://127.0.0.1:8765/tasks/{id}`  
@@ -60,6 +61,9 @@ CI：`.github/workflows/fleet-kit.yml` 在改动 `fleet-kit/` 的 PR 上跑单�
 | 审计关联（T09） | `GET /tasks/{id}/correlation` → `ok: true`，3/3 条消息、2/2 个回执对得上审计；被拒请求有 `request.denied` 记录（见 `tests/test_t09_correlation.py`） |
 | 审计访问范围 | 租户管理员 `/audit/verify` 只得到 `{"ok"}`；Agent Key `403`；明细只在 `/ops/*`（运维 Key）；未认证拒绝记在 `sys:unauthenticated`，没有租户读得到（见 `tests/test_audit_access.py`） |
 | 审计防刷 | 300 次错误 Key 只产生 1 条单独记录 + 窗口结束后 1 条汇总；链校验仍通过（见 `tests/test_denial_flood.py`） |
+| 只存哈希 | Hub 配置里只有 `sha256:` / `hmac-sha256:`；明文 Key 配置启动即拒绝，报错只写变量名（见 `tests/test_b2_bruteforce.py`） |
+| 暴力破解退避 | 同一错误 Key 连续 5 次后 `429` + `Retry-After`，逐次翻倍；成功清零；共享代理后已在用的 Key 不受影响（见 `tests/test_b2_bruteforce.py`） |
+| 随机演示 Key | `mcp-host.example.json` / `demo.sh` / `config.py` 无可猜字面量；`gen_keys.py demo` 每次生成新 Key |
 | MCP 同账本 | `mcp_http_parity` 或 Cursor 工具留下同一 `task_id` |
 | 口径 | README/`protocol` 为 `fleet`，无「已兼容 A2A」 |
 

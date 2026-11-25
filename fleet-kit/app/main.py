@@ -70,8 +70,10 @@ def shutdown():
 
 # T09 / whitepaper §8.3 "security anomalies": requests our code refuses are
 # audited. Only fastapi.HTTPException raised by this app counts; Starlette's
-# own 404/405 for unknown routes are not recorded (scanner noise).
-AUDITED_DENIALS = {401, 403, 404, 409}
+# own 404/405 for unknown routes are not recorded (scanner noise). 429 is the
+# brute-force backoff (app/identity/attempts.py); like every denial it goes
+# through denial_limiter, so a guessing flood cannot grow the log either.
+AUDITED_DENIALS = {401, 403, 404, 409, 429}
 
 # Flood protection: only the first few denials per source/principal and
 # window get their own entry; the rest are counted into summaries. See

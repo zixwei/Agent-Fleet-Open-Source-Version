@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 
+from app.identity.keyhash import hash_key, hash_key_map
+
 N = 1200  # more than the old 1000-entry window
 
 
@@ -153,7 +155,7 @@ def test_verify_endpoint_tenant_admin_sees_only_ok(monkeypatch, fresh_db):
     numbers or hashes of the platform-wide log."""
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps({"key-a": "tenant-a"}))
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map({"key-a": "tenant-a"})))
     from app.main import app
 
     client = TestClient(app)
@@ -169,8 +171,8 @@ def test_verify_endpoint_tenant_admin_sees_only_ok(monkeypatch, fresh_db):
 def test_verify_endpoint_operator_gets_details(monkeypatch):
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps({"key-a": "tenant-a"}))
-    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", OPERATOR_KEY)
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map({"key-a": "tenant-a"})))
+    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", hash_key(OPERATOR_KEY))
     from app.main import app
 
     client = TestClient(app)
