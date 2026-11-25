@@ -11,7 +11,7 @@
 
 | 运维 Key（可选） | `AI_FLEET_OPERATOR_API_KEY` | `{tenant_id: "sys:operator"}` | 只能调 `/ops/*`：跨租户审计视图、完整链校验 |
 
-运维 Key 至少 24 个字符（由 `scripts/gen_keys.py` 签发时保证），且不能和任何租户 Key、Agent Key 相同，否则 `/ops/*` 全部关闭、启动检查报错；它过不了租户或 Agent 接口，租户和 Agent Key 也过不了 `/ops/*`。比较用常数时间。
+运维 Key 至少 24 个字符（由 `scripts/gen_keys.py` 签发时保证），且不能和任何租户 Key、Agent Key 相同（为此四个 Key 变量的全部条目须是同一种哈希：全 `hmac-sha256` 且设了 pepper，或全 `sha256`；混用同样启动报错），否则 `/ops/*` 全部关闭、启动检查报错；它过不了租户或 Agent 接口，租户和 Agent Key 也过不了 `/ops/*`。比较用常数时间。
 
 上表四个变量里放的都是 **Key 的哈希**，不是 Key 本身，见下一节。
 

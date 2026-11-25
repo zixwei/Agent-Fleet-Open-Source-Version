@@ -333,9 +333,15 @@ def test_no_default_key(fresh_db, monkeypatch):
 
 
 def test_hmac_pepper_hashes(fresh_db, monkeypatch):
+    import app.config as config
+
     pepper = "pepper-" + "x" * 40
     monkeypatch.setenv("AI_FLEET_KEY_PEPPER", pepper)
     monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map(TENANT_KEYS, pepper)))
+    # One scheme per deployment: the other three key settings are hmac-sha256 too.
+    monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(hash_key_map(AGENT_KEYS, pepper)))
+    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", hash_key(OPERATOR_KEY, pepper))
+    monkeypatch.setattr(config, "API_KEY", hash_key("smoke-test-key", pepper))  # frozen at import
     from app import identity
     from app.main import app
 
@@ -356,6 +362,52 @@ def test_hashed_operator_key_reuse_detected(fresh_db, monkeypatch):
     monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", hash_key("key-a"))  # same as a tenant key
     assert any("must differ" in p for p in identity.validate_key_config())
     assert TestClient(app).get("/ops/audit", headers=ADMIN).status_code == 401
+
+
+def test_cross_scheme_operator_key_reuse_refused(fresh_db, monkeypatch):
+    """Same key K as a sha256 tenant key and an hmac-sha256 operator key: the two
+    hashes differ as strings, so the reuse check alone cannot see it; the
+    one-scheme rule refuses the configuration and /ops/* stays closed."""
+    from app import identity, main
+    from app.main import app
+
+    pepper = "pepper-" + "x" * 40
+    monkeypatch.setenv("AI_FLEET_KEY_PEPPER", pepper)
+    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", hash_key("key-a", pepper))  # tenant key-a is sha256
+    problems = identity.validate_key_config()
+    mixed = [p for p in problems if "one scheme" in p]
+    assert len(mixed) == 1
+    assert "AI_FLEET_TENANT_API_KEYS" in mixed[0] and "AI_FLEET_OPERATOR_API_KEY" in mixed[0]
+    values = ("key-a", hash_key("key-a").split(":", 1)[1], hash_key("key-a", pepper).split(":", 1)[1], pepper)
+    assert all(v not in p for v in values for p in problems)  # names settings, never values
+    with pytest.raises(RuntimeError) as excinfo:
+        main.startup()
+    assert "one scheme" in str(excinfo.value)
+    c = TestClient(app)
+    assert c.get("/ops/audit", headers=ADMIN).status_code == 401  # K does not pass as operator
+    assert c.get("/tasks", headers=ADMIN).status_code == 200
+
+
+@pytest.mark.parametrize("pepper", ["", "pepper-" + "x" * 40], ids=["all-sha256", "all-hmac-sha256"])
+def test_single_scheme_deployment_starts(fresh_db, monkeypatch, pepper):
+    import app.config as config
+    from app import identity, main
+    from app.main import app
+
+    if pepper:
+        monkeypatch.setenv("AI_FLEET_KEY_PEPPER", pepper)
+    else:
+        monkeypatch.delenv("AI_FLEET_KEY_PEPPER", raising=False)
+    # hash_key(k, "") is sha256, hash_key(k, pepper) hmac-sha256: all four settings alike.
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map(TENANT_KEYS, pepper)))
+    monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(hash_key_map(AGENT_KEYS, pepper)))
+    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", hash_key(OPERATOR_KEY, pepper))
+    monkeypatch.setattr(config, "API_KEY", hash_key("smoke-test-key", pepper))  # frozen at import
+    assert identity.validate_key_config() == []
+    main.startup()  # does not raise
+    c = TestClient(app)
+    assert c.get("/tasks", headers=ADMIN).status_code == 200
+    assert c.get("/ops/audit", headers=OP).status_code == 200
 
 
 # Plaintext configuration is refused.

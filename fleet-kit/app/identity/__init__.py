@@ -190,7 +190,7 @@ def _operator_key_hash() -> str:
     value = os.environ.get(OPERATOR_KEY_ENV, "")
     if not value:
         return ""
-    unusable = bool(_operator_key_problems(value)) or (
+    unusable = bool(_operator_key_problems(value)) or bool(_scheme_problems()) or (
         keyhash.scheme_of(value) == keyhash.SCHEME_HMAC and not _pepper()
     )
     if unusable:
@@ -199,10 +199,43 @@ def _operator_key_hash() -> str:
     return keyhash.normalize(value)
 
 
+def _key_schemes() -> dict:
+    """Hash scheme -> names of the key settings holding entries in it, over all
+    four key settings. Plaintext entries are left out (reported elsewhere)."""
+    settings = (
+        (TENANT_KEYS_ENV, list(_tenant_key_map())),
+        (AGENT_KEYS_ENV, list(_agent_key_map())),
+        (API_KEY_ENV, [config.API_KEY]),
+        (OPERATOR_KEY_ENV, [os.environ.get(OPERATOR_KEY_ENV, "")]),
+    )
+    schemes = {}
+    for var, values in settings:
+        for value in values:
+            if keyhash.is_hashed(value):
+                names = schemes.setdefault(keyhash.scheme_of(value), [])
+                if var not in names:
+                    names.append(var)
+    return schemes
+
+
 def _uses_hmac() -> bool:
-    values = list(_tenant_key_map()) + list(_agent_key_map())
-    values += [config.API_KEY, os.environ.get(OPERATOR_KEY_ENV, "")]
-    return any(keyhash.is_hashed(v) and keyhash.scheme_of(v) == keyhash.SCHEME_HMAC for v in values)
+    return keyhash.SCHEME_HMAC in _key_schemes()
+
+
+def _scheme_problems() -> list:
+    """One hash scheme per deployment. sha256(K) and hmac-sha256(K) of the same
+    key K differ as strings, so the operator reuse check (a hash comparison)
+    cannot see K reused across schemes; refusing a mixed configuration keeps
+    that check sound. Messages name settings only, never key values."""
+    schemes = _key_schemes()
+    if len(schemes) < 2:
+        return []
+    return [
+        f"key hashes must all use one scheme (all {keyhash.SCHEME_HMAC} with {keyhash.PEPPER_ENV} set, "
+        f"or all {keyhash.SCHEME_SHA256}), but {keyhash.SCHEME_SHA256} is used in "
+        f"{', '.join(schemes[keyhash.SCHEME_SHA256])} and {keyhash.SCHEME_HMAC} in "
+        f"{', '.join(schemes[keyhash.SCHEME_HMAC])}"
+    ]
 
 
 def validate_key_config() -> list:
@@ -227,6 +260,7 @@ def validate_key_config() -> list:
         problems.append(f"{keyhash.PEPPER_ENV} must be at least {keyhash.MIN_PEPPER_LENGTH} characters")
     if not pepper and _uses_hmac():
         problems.append(f"hmac-sha256 key hashes are configured but {keyhash.PEPPER_ENV} is not set")
+    problems.extend(_scheme_problems())
     key = os.environ.get(OPERATOR_KEY_ENV, "")
     if key:
         problems.extend(_operator_key_problems(key))
