@@ -104,9 +104,24 @@ def init_db() -> None:
             r[1] for r in conn.execute("PRAGMA table_info(agents)").fetchall()
         }
         if "tenant_id" not in cols:
+            # Legacy rows belong to the tenant this deployment was running
+            # as (AI_FLEET_TENANT), which is also the tenant their tasks
+            # already carry; the literal 'default' would orphan them when
+            # AI_FLEET_TENANT is set to something else. Fail closed on a
+            # malformed tenant id instead of writing it into every row.
+            from app.identity import valid_tenant_id
+
+            tenant_id = config.DEFAULT_TENANT
+            if not valid_tenant_id(tenant_id):
+                raise RuntimeError(
+                    f"cannot migrate agents: AI_FLEET_TENANT {tenant_id!r} is not a valid tenant id"
+                )
             conn.execute(
                 "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
             )
+            # Every existing row is a legacy row at this point (the column
+            # was just added), so this touches nothing created later.
+            conn.execute("UPDATE agents SET tenant_id = ?", (tenant_id,))
         # Migrate older tasks tables (no creator column). NULL = created
         # with a tenant/admin credential.
         task_cols = {
@@ -197,6 +212,17 @@ def audit_head():
             "SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
         ).fetchone()
     return (row["seq"], row["entry_hash"]) if row else (0, "GENESIS")
+
+
+def get_audit_entry(seq):
+    """One audit entry by seq, or None (checkpoint check in verify_chain)."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM audit_log WHERE seq = ?", (seq,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["detail"] = json.loads(d["detail"])
+    return d
 
 
 def list_audit_from_seq(after_seq=0, limit=1000):

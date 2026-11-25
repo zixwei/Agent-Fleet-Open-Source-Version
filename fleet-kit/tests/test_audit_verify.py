@@ -113,7 +113,11 @@ def test_incremental_with_wrong_anchor_fails():
     _fill(5)
     bad = audit.verify_chain(after_seq=first["head_seq"], anchor_hash="0" * 64)
     assert bad["ok"] is False
-    assert bad["broken_at_seq"] == first["head_seq"] + 1
+    # The checkpoint row itself no longer matches the kept anchor.
+    assert bad["broken_at_seq"] == first["head_seq"]
+    # Even with nothing appended after the checkpoint (previously ok=True).
+    head = audit.verify_chain()
+    assert audit.verify_chain(after_seq=head["head_seq"], anchor_hash="0" * 64)["ok"] is False
 
 
 def test_incremental_requires_anchor():
