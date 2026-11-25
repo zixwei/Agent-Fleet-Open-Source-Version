@@ -44,8 +44,13 @@ ROUNDS = 25
 def fresh_db(tmp_path, monkeypatch):
     db_path = tmp_path / "followups.db"
     monkeypatch.setenv("AI_FLEET_DB", f"sqlite:///{db_path}")
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(TENANT_KEYS))
-    monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(AGENT_KEYS))
+    # Hashed form only (B2): the app ignores plaintext entries (fail closed),
+    # so the fixtures are stored as keyhash.hash_key_map(...) of the keys the
+    # tests still present in plaintext in X-API-Key headers.
+    from app.identity import keyhash
+
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(keyhash.hash_key_map(TENANT_KEYS)))
+    monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(keyhash.hash_key_map(AGENT_KEYS)))
     import app.config as config
 
     config.DATABASE_PATH = str(db_path)
@@ -410,8 +415,11 @@ def test_intact_checkpoint_still_verifies_incrementally():
 
 
 def test_ops_endpoint_reports_missing_checkpoint(monkeypatch, fresh_db):
+    from app.identity import keyhash
+
     op_key = "op-key-0123456789abcdef-xyz"
-    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", op_key)
+    # Hashed form only (B2); the header still presents the plaintext key.
+    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", keyhash.hash_key(op_key))
     from app.main import app
     from app import observability as audit
 
@@ -479,12 +487,17 @@ def test_legacy_agents_join_configured_default_tenant(tmp_path, monkeypatch):
 
     # Single-key mode: AI_FLEET_API_KEY maps to AI_FLEET_TENANT ("acme").
     monkeypatch.delenv("AI_FLEET_TENANT_API_KEYS", raising=False)
+    # Hashed form only (B2); the header still presents the plaintext key.
+    from app.identity import keyhash
+
     monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(
-        {"key-legacy": {"agent_id": "legacy", "tenant_id": "acme"}}))
+        keyhash.hash_key_map({"key-legacy": {"agent_id": "legacy", "tenant_id": "acme"}})))
     from app.main import app
 
     c = TestClient(app)
-    admin = {"X-API-Key": config.API_KEY}
+    # Present the plaintext single key ("smoke-test-key", see conftest.py):
+    # config.API_KEY already holds its hash, which the app would hash again.
+    admin = {"X-API-Key": "smoke-test-key"}
     assert [a["agent_id"] for a in c.get("/agents", headers=admin).json()] == ["legacy"]
     # The migrated agent can be assigned new work and authenticate.
     r = c.post("/tasks", json={"agent_id": "legacy", "title": "new"}, headers=admin)
