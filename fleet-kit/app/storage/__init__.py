@@ -104,9 +104,24 @@ def init_db() -> None:
             r[1] for r in conn.execute("PRAGMA table_info(agents)").fetchall()
         }
         if "tenant_id" not in cols:
+            # Legacy rows belong to the tenant this deployment was running
+            # as (AI_FLEET_TENANT), which is also the tenant their tasks
+            # already carry; the literal 'default' would orphan them when
+            # AI_FLEET_TENANT is set to something else. Fail closed on a
+            # malformed tenant id instead of writing it into every row.
+            from app.identity import valid_tenant_id
+
+            tenant_id = config.DEFAULT_TENANT
+            if not valid_tenant_id(tenant_id):
+                raise RuntimeError(
+                    f"cannot migrate agents: AI_FLEET_TENANT {tenant_id!r} is not a valid tenant id"
+                )
             conn.execute(
                 "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
             )
+            # Every existing row is a legacy row at this point (the column
+            # was just added), so this touches nothing created later.
+            conn.execute("UPDATE agents SET tenant_id = ?", (tenant_id,))
         # Migrate older tasks tables (no creator column). NULL = created
         # with a tenant/admin credential.
         task_cols = {
@@ -199,6 +214,17 @@ def audit_head():
     return (row["seq"], row["entry_hash"]) if row else (0, "GENESIS")
 
 
+def get_audit_entry(seq):
+    """One audit entry by seq, or None (checkpoint check in verify_chain)."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM audit_log WHERE seq = ?", (seq,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["detail"] = json.loads(d["detail"])
+    return d
+
+
 def list_audit_from_seq(after_seq=0, limit=1000):
     """Oldest-first batch of entries with seq > after_seq (chain verification)."""
     with connect() as conn:
@@ -258,8 +284,28 @@ def list_tasks(tenant_id=None):
 
 def insert_message(envelope):
     """Insert a message. Returns True if inserted, False if the
-    idempotency key already exists (duplicate delivery)."""
+    idempotency key already exists (duplicate delivery).
+
+    A row stored under the key's legacy (pre-encoding) form is the same
+    message: its key is moved to the encoded form in place (same row, same
+    message_id) and False is returned, so the caller fetches that row."""
+    from app.messaging import legacy_form_of_key
+
+    key = envelope["idempotency_key"]
+    legacy = legacy_form_of_key(key)
     with connect() as conn:
+        if legacy != key:
+            try:
+                cur = conn.execute(
+                    "UPDATE messages SET idempotency_key = ? WHERE idempotency_key = ?",
+                    (key, legacy),
+                )
+            except sqlite3.IntegrityError:
+                # Both forms exist; the row under the encoded key is the original.
+                return False
+            if cur.rowcount > 0:
+                conn.commit()
+                return False
         try:
             conn.execute(
                 "INSERT INTO messages (idempotency_key, message_id, event_id, task_id, tenant_id, sender_agent_id, recipient_agent_id, event_type, payload, created_at, context_id, correlation_id, trace_id, protocol, protocol_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -288,11 +334,21 @@ def insert_message(envelope):
 
 
 def get_message_by_key(idempotency_key):
+    """Exact key first, then its legacy (pre-encoding) form, so a row stored
+    before key components were percent-encoded is still found."""
+    from app.messaging import legacy_form_of_key
+
+    legacy = legacy_form_of_key(idempotency_key)
     with connect() as conn:
         row = conn.execute(
             "SELECT * FROM messages WHERE idempotency_key = ?",
             (idempotency_key,),
         ).fetchone()
+        if not row and legacy != idempotency_key:
+            row = conn.execute(
+                "SELECT * FROM messages WHERE idempotency_key = ?",
+                (legacy,),
+            ).fetchone()
     if not row:
         return None
     d = dict(row)

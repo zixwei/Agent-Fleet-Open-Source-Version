@@ -72,7 +72,11 @@ def verify_chain(after_seq: int = 0, anchor_hash: str | None = None, batch: int 
     Incremental (after_seq=N > 0): the caller must pass anchor_hash, the
     head_hash of seq N that it kept from an earlier successful run. The
     anchor is never read from the log itself: a starting hash taken from
-    the log would let a rewritten log vouch for itself.
+    the log would let a rewritten log vouch for itself. Row N itself must
+    still exist, its stored entry_hash must equal the anchor, and its
+    content must still hash to it; otherwise deleting (or rewriting) only
+    the checkpoint row would go unnoticed, because row N+1 still points at
+    the anchor.
 
     Returns {"ok", "checked", "head_seq", "head_hash"} on success, or
     {"ok": False, "broken_at_seq" | "reason", ...} on failure. Keep head_hash
@@ -95,6 +99,26 @@ def verify_chain(after_seq: int = 0, anchor_hash: str | None = None, batch: int 
             "checkpoint_seq": after_seq,
             "head_seq": head_seq,
         }
+    if after_seq > 0:
+        anchor = db.get_audit_entry(after_seq)
+        if anchor is None:
+            return {
+                "ok": False,
+                "reason": "checkpoint entry missing (entries removed)",
+                "checkpoint_seq": after_seq,
+                "checked": 0,
+            }
+        recomputed = _entry_hash(
+            anchor["prev_hash"], anchor["created_at"], anchor["actor"],
+            anchor["action"], anchor["target"], anchor["detail"],
+        )
+        if anchor["entry_hash"] != prev or recomputed != prev:
+            return {
+                "ok": False,
+                "reason": "checkpoint entry does not match anchor_hash",
+                "broken_at_seq": after_seq,
+                "checked": 0,
+            }
     checked = 0
     last_seq = after_seq
     while True:
@@ -130,8 +154,16 @@ def correlate_task(tenant_id: str, task_id: str) -> dict:
     same message_id and trace_id, recorded under a principal that matches
     its sender when the sender used an agent key. Receipts need a matching
     message.receipt entry by the recipient agent. The task needs a
-    task.create entry, and its status must equal the last audited
-    transition. Caller must have checked that the task belongs to tenant_id.
+    task.create entry whose trace_id equals the task's current trace_id,
+    and its status must equal the end of the audited transition chain
+    (submitted -> to -> ...). The chain is followed by "from"/"to" rather
+    than taken from the newest entry, because two overlapping requests may
+    append their audit entries in the opposite order of their
+    compare-and-set writes. An older-format entry (no "from") is taken to
+    leave the state the previous entry (by seq) moved to; when such entries
+    are present and the chain does not end at the newest entry, the newest
+    entry wins (the 7a44718 rule), so mixed history is not misreported.
+    Caller must have checked that the task belongs to tenant_id.
     """
     task = db.get_task(task_id)
     if task is None:
@@ -140,25 +172,49 @@ def correlate_task(tenant_id: str, task_id: str) -> dict:
     entries = db.list_audit_for_target(actor=tenant_id, target=task_id)
 
     sends, receipts = {}, {}
-    created = False
+    created = None  # detail of the first task.create entry
     last_status = None
+    prev_status = "submitted"  # state the previous task.status entry moved to
+    has_legacy_status = False
+    moves = {}  # from -> to, one per state (CAS: a state is left at most once)
     for e in entries:
         d, action = e["detail"], e["action"]
         if action == "task.create":
-            created = True
+            if created is None:
+                created = d
         elif action == "message.send":
             sends.setdefault(d.get("message_id"), d)
         elif action == "message.receipt":
             receipts.setdefault(d.get("message_id"), d)
         elif action == "task.status":
-            last_status = d.get("to", d.get("status"))
+            to = d.get("to", d.get("status"))
+            if to is None:
+                continue
+            last_status = to
+            if d.get("from") is not None:
+                moves.setdefault(d["from"], to)
+            else:
+                # Older format (no "from"): it left the previous entry's state.
+                moves.setdefault(prev_status, to)
+                has_legacy_status = True
+            prev_status = to
 
     problems = []
     if not task.get("trace_id"):
         problems.append({"task_id": task_id, "missing": ["task.trace_id"]})
-    if not created:
+    if created is None:
         problems.append({"task_id": task_id, "missing": ["audit.task.create"]})
-    expected = last_status or "submitted"
+    elif created.get("trace_id") != task.get("trace_id"):
+        # The trace was changed after creation, around the API.
+        problems.append({"task_id": task_id, "missing": ["audit.task.trace_id_mismatch"]})
+    expected, seen = "submitted", set()
+    while expected in moves and expected not in seen:
+        seen.add(expected)
+        expected = moves[expected]
+    if has_legacy_status and expected != last_status:
+        # History has entries without "from" (older format), which the chain
+        # cannot order reliably: the newest entry wins, as in 7a44718.
+        expected = last_status
     if task["status"] != expected:
         problems.append({
             "task_id": task_id,

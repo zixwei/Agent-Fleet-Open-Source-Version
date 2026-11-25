@@ -305,6 +305,10 @@ def set_task_status(task_id: str, body: StatusIn, auth=Depends(require_api_key))
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # Record what this request's compare-and-set wrote (previous ->
+    # body.status). task is re-read after the CAS, so a later overlapping
+    # transition may already show in task["status"]; that one is audited by
+    # its own request.
     audit.record(
         auth["tenant_id"],
         "task.status",
@@ -312,7 +316,7 @@ def set_task_status(task_id: str, body: StatusIn, auth=Depends(require_api_key))
         {
             "task_id": task_id,
             "from": previous,
-            "to": task["status"],
+            "to": body.status,
             "trace_id": task.get("trace_id"),
             "principal": audit.principal(auth),
         },
