@@ -7,3 +7,6 @@ __pycache__/
 .demo-out.txt
 *.db
 .pytest_cache/
+# Generated demo keys (scripts/gen_keys.py demo): never commit.
+.demo-keys.env
+mcp-host.json

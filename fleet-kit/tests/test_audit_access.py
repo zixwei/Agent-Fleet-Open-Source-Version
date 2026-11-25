@@ -23,6 +23,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from fastapi.testclient import TestClient
 
+from app.identity.keyhash import hash_key, hash_key_map
+
 OPERATOR_KEY = "op-key-0123456789abcdef-xyz"
 TENANT_KEYS = {"key-a": "tenant-a", "key-b": "tenant-b"}
 AGENT_KEYS = {"key-worker": {"agent_id": "worker", "tenant_id": "tenant-a"}}
@@ -35,9 +37,9 @@ OP = {"X-API-Key": OPERATOR_KEY}
 def fresh_db(tmp_path, monkeypatch):
     db_path = tmp_path / "access.db"
     monkeypatch.setenv("AI_FLEET_DB", f"sqlite:///{db_path}")
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(TENANT_KEYS))
-    monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(AGENT_KEYS))
-    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", OPERATOR_KEY)
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map(TENANT_KEYS)))
+    monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(hash_key_map(AGENT_KEYS)))
+    monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", hash_key(OPERATOR_KEY))
     import app.config as config
 
     config.DATABASE_PATH = str(db_path)
@@ -118,7 +120,7 @@ def test_unauthenticated_denials_use_reserved_actor(client, fresh_db):
 @pytest.mark.parametrize("bad_tenant", ["sys:unauthenticated", "unauth:x", "", " a", "a/b", "x" * 65])
 def test_tenant_key_with_malformed_tenant_id_is_refused(client, monkeypatch, bad_tenant):
     keys = dict(TENANT_KEYS, **{"key-evil": bad_tenant})
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(keys))
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map(keys)))
     assert client.get("/audit", headers={"X-API-Key": "key-evil"}).status_code == 401
     from app import identity
 
@@ -127,7 +129,7 @@ def test_tenant_key_with_malformed_tenant_id_is_refused(client, monkeypatch, bad
 
 def test_agent_key_with_malformed_tenant_id_is_refused(client, monkeypatch, fresh_db):
     keys = dict(AGENT_KEYS, **{"key-evil-agent": {"agent_id": "worker", "tenant_id": "sys:operator"}})
-    monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(keys))
+    monkeypatch.setenv("AI_FLEET_AGENT_API_KEYS", json.dumps(hash_key_map(keys)))
     assert client.get("/tasks", headers={"X-API-Key": "key-evil-agent"}).status_code == 401
     # Filed as unauthenticated, never under the malformed (system) actor.
     conn = sqlite3.connect(str(fresh_db))
@@ -140,7 +142,7 @@ def test_previous_unauthenticated_tenant_name_is_now_just_a_tenant(client, monke
     """A tenant may still be called "unauthenticated" (no colon), but it no
     longer collides with the system actor and sees nothing it should not."""
     keys = dict(TENANT_KEYS, **{"key-u": "unauthenticated"})
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(keys))
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map(keys)))
     assert client.get("/tasks", headers={"X-API-Key": "bad"}).status_code == 401
     seen = client.get("/audit", headers={"X-API-Key": "key-u"}).json()
     assert seen == []
@@ -157,7 +159,7 @@ def test_default_tenant_is_validated(monkeypatch):
 def test_startup_refuses_bad_configuration(monkeypatch):
     from app import main
 
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps({"k": "sys:x"}))
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map({"k": "sys:x"})))
     with pytest.raises(RuntimeError):
         main.startup()
 

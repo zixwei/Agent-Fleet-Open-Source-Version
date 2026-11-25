@@ -42,6 +42,11 @@ mcp = FastMCP(
 def _headers() -> dict[str, str]:
     if not AGENT_KEY:
         raise RuntimeError("Set FLEET_AGENT_API_KEY (this host's agent key)")
+    if AGENT_KEY.startswith("${"):
+        raise RuntimeError(
+            "FLEET_AGENT_API_KEY is still the mcp-host.example.json placeholder; "
+            "generate keys with: python3 scripts/gen_keys.py demo --mcp-host mcp-host.json"
+        )
     return {"X-API-Key": AGENT_KEY, "Content-Type": "application/json"}
 
 

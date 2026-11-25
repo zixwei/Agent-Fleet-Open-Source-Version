@@ -5,7 +5,7 @@
       "args": ["/ABS/PATH/TO/fleet-kit/mcp_server.py"],
       "env": {
         "FLEET_HUB_URL": "http://127.0.0.1:8765",
-        "FLEET_AGENT_API_KEY": "fleet-demo-orch",
+        "FLEET_AGENT_API_KEY": "${FLEET_AGENT_A_KEY}",
         "FLEET_AGENT_ID": "orchestrator"
       }
     },
@@ -14,7 +14,7 @@
       "args": ["/ABS/PATH/TO/fleet-kit/mcp_server.py"],
       "env": {
         "FLEET_HUB_URL": "http://127.0.0.1:8765",
-        "FLEET_AGENT_API_KEY": "fleet-demo-worker",
+        "FLEET_AGENT_API_KEY": "${FLEET_AGENT_B_KEY}",
         "FLEET_AGENT_ID": "worker"
       }
     }

@@ -1,4 +1,5 @@
 """Smoke tests for Fleet Kit Hub (copied semantics, protocol=fleet)."""
+import hashlib
 import os
 import sys
 
@@ -8,9 +9,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 os.environ["AI_FLEET_DB"] = "sqlite:////tmp/fleet_kit_smoke.db"
-os.environ["AI_FLEET_API_KEY"] = "smoke-test-key"
+# Hashed form only (B2); the client still presents "smoke-test-key".
+os.environ["AI_FLEET_API_KEY"] = "sha256:" + hashlib.sha256(b"smoke-test-key").hexdigest()
 
 from app.main import app  # noqa: E402
+from app.identity.keyhash import hash_key_map  # noqa: E402
 
 HEADERS = {"X-API-Key": "smoke-test-key"}
 
@@ -86,7 +89,7 @@ def test_tenant_cannot_suspend_foreign_agent(tmp_path, monkeypatch):
     monkeypatch.setenv("AI_FLEET_DB", f"sqlite:///{db_path}")
     monkeypatch.setenv(
         "AI_FLEET_TENANT_API_KEYS",
-        json.dumps({"key-a": "tenant-a", "key-b": "tenant-b"}),
+        json.dumps(hash_key_map({"key-a": "tenant-a", "key-b": "tenant-b"})),
     )
     import app.config as config
 
@@ -116,7 +119,7 @@ def test_tenant_cannot_suspend_foreign_agent(tmp_path, monkeypatch):
     # Agent key cannot suspend either
     monkeypatch.setenv(
         "AI_FLEET_AGENT_API_KEYS",
-        json.dumps({"agent-key": {"agent_id": "agent-a", "tenant_id": "tenant-a"}}),
+        json.dumps(hash_key_map({"agent-key": {"agent_id": "agent-a", "tenant_id": "tenant-a"}})),
     )
     assert client.post("/agents/agent-a/suspend", headers={"X-API-Key": "agent-key"}).status_code == 403
 

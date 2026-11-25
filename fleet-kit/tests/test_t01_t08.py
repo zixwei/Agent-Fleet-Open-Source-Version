@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from fastapi.testclient import TestClient
 
+from app.identity.keyhash import hash_key_map
+
 os.environ["AI_FLEET_DB"] = "sqlite:////tmp/ai_fleet_t01_t08.db"
 
 TENANT_KEYS = {"key-a": "tenant-a", "key-b": "tenant-b"}
@@ -33,7 +35,7 @@ HEADERS_B = {"X-API-Key": "key-b"}
 def fresh_db(tmp_path, monkeypatch):
     db_path = tmp_path / "t01_t08.db"
     monkeypatch.setenv("AI_FLEET_DB", f"sqlite:///{db_path}")
-    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(TENANT_KEYS))
+    monkeypatch.setenv("AI_FLEET_TENANT_API_KEYS", json.dumps(hash_key_map(TENANT_KEYS)))
     import app.config as config
 
     config.DATABASE_PATH = str(db_path)
