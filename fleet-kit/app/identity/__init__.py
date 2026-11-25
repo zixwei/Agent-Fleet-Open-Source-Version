@@ -164,6 +164,51 @@ def _map_problems(var: str) -> list:
     return []
 
 
+def _duplicate_hash_problems() -> list:
+    """A key hash configured twice with different letter case, in any key setting.
+
+    Hashes are compared after normalize() (lower-case hex), so two entries
+    that differ only in letter case are the same key: the second can never
+    match, because find() returns the first. The same hash string written
+    identically in two settings (as the demo does for the single key and
+    the demo tenant key) is the same key on purpose and is left alone.
+    The operator key is left out here: _operator_key_problems() already
+    reports it, also after normalize(), when it reuses a tenant or agent
+    key. Messages name settings only, never key values.
+    """
+    seen = {}
+    problems = []
+    settings = (
+        (TENANT_KEYS_ENV, list(_tenant_key_map())),
+        (AGENT_KEYS_ENV, list(_agent_key_map())),
+        (API_KEY_ENV, [config.API_KEY] if config.API_KEY else []),
+    )
+    for var, values in settings:
+        for value in values:
+            if not keyhash.is_hashed(value):
+                continue
+            normalized = keyhash.normalize(value)
+            if normalized in seen:
+                first_var, first_value = seen[normalized]
+                if value == first_value:
+                    continue  # identical hash string: intentional reuse, not a shadow
+                if first_var == var:
+                    problems.append(
+                        f"{var} contains a duplicate key hash (the same hash "
+                        "twice after lower-casing the hex; entries that differ "
+                        "only in letter case are the same key)"
+                    )
+                else:
+                    problems.append(
+                        f"{var} contains a key hash already configured in {first_var} "
+                        "(duplicate after lower-casing the hex; entries that "
+                        "differ only in letter case are the same key)"
+                    )
+            else:
+                seen[normalized] = (var, value)
+    return problems
+
+
 def _operator_key_problems(value: str) -> list:
     """Problems with the operator key setting. Messages name settings only."""
     problems = []
@@ -246,6 +291,7 @@ def validate_key_config() -> list:
         problems.append(f"AI_FLEET_TENANT {config.DEFAULT_TENANT!r} is not a valid tenant id")
     problems.extend(_map_problems(TENANT_KEYS_ENV))
     problems.extend(_map_problems(AGENT_KEYS_ENV))
+    problems.extend(_duplicate_hash_problems())
     for tenant_id in _tenant_key_map().values():
         if not valid_tenant_id(tenant_id):
             problems.append(f"AI_FLEET_TENANT_API_KEYS: invalid tenant id {tenant_id!r}")

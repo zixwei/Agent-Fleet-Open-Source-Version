@@ -229,6 +229,14 @@ def test_lookup_compares_every_entry_in_constant_time(monkeypatch):
     assert keyhash.find(keyhash.presented_hashes("zzz"), entries) is None
 
 
+def test_find_matches_uppercase_stored_hash():
+    """A single entry written with upper-case hex is not silently dead:
+    find() normalizes the stored hash before comparing it."""
+    upper = "sha256:" + hashlib.sha256(b"k").hexdigest().upper()
+    assert keyhash.find(keyhash.presented_hashes("k"), [(upper, "K")]) == "K"
+    assert keyhash.find(keyhash.presented_hashes("other"), [(upper, "K")]) is None
+
+
 # ---------------------------------------------------------------- HTTP
 
 
@@ -362,6 +370,79 @@ def test_hashed_operator_key_reuse_detected(fresh_db, monkeypatch):
     monkeypatch.setenv("AI_FLEET_OPERATOR_API_KEY", hash_key("key-a"))  # same as a tenant key
     assert any("must differ" in p for p in identity.validate_key_config())
     assert TestClient(app).get("/ops/audit", headers=ADMIN).status_code == 401
+
+
+@pytest.mark.parametrize("var", ["AI_FLEET_TENANT_API_KEYS", "AI_FLEET_AGENT_API_KEYS"])
+def test_case_only_duplicate_hash_refused_at_startup(fresh_db, monkeypatch, var):
+    """Two hashes that differ only in letter case are the same key: the
+    second entry can never match, because find() returns the first. The
+    configuration is refused instead of silently accepted."""
+    from app import identity, main
+
+    lower = hash_key("key-a")  # already configured as a tenant key
+    upper = "sha256:" + lower.split(":", 1)[1].upper()
+    if var == "AI_FLEET_TENANT_API_KEYS":
+        monkeypatch.setenv(var, json.dumps({lower: "tenant-a", upper: "tenant-b"}))
+    else:
+        monkeypatch.setenv(
+            var,
+            json.dumps(
+                {
+                    lower: {"agent_id": "worker", "tenant_id": "tenant-a"},
+                    upper: {"agent_id": "other", "tenant_id": "tenant-b"},
+                }
+            ),
+        )
+    problems = identity.validate_key_config()
+    assert any(var in p and "duplicate" in p for p in problems)
+    assert all(lower.split(":", 1)[1] not in p for p in problems)  # names settings, never values
+    with pytest.raises(RuntimeError) as excinfo:
+        main.startup()
+    assert var in str(excinfo.value) and "duplicate" in str(excinfo.value)
+
+
+def test_case_only_duplicate_across_tenant_and_agent_maps_refused(fresh_db, monkeypatch):
+    """The same key hash in the tenant map and, in upper-case hex,
+    in the agent map is the same key twice: the agent entry would
+    win and the tenant entry would be shadowed."""
+    from app import identity
+
+    upper = "sha256:" + hash_key("key-a").split(":", 1)[1].upper()
+    monkeypatch.setenv(
+        "AI_FLEET_AGENT_API_KEYS",
+        json.dumps({upper: {"agent_id": "other", "tenant_id": "tenant-b"}}),
+    )
+    problems = identity.validate_key_config()
+    assert any("AI_FLEET_AGENT_API_KEYS" in p and "duplicate" in p for p in problems)
+    assert any("AI_FLEET_TENANT_API_KEYS" in p for p in problems)
+
+
+def test_single_key_duplicating_a_tenant_key_hash_refused(fresh_db, monkeypatch):
+    """AI_FLEET_API_KEY holding the same hash as a tenant key, in
+    upper-case hex, is the same key twice: it can never be reached while
+    the tenant map is configured."""
+    import app.config as config
+    from app import identity
+
+    upper = "sha256:" + hash_key("key-a").split(":", 1)[1].upper()
+    monkeypatch.setattr(config, "API_KEY", upper)
+    problems = identity.validate_key_config()
+    assert any("AI_FLEET_API_KEY" in p and "duplicate" in p for p in problems)
+
+
+def test_uppercase_single_hash_is_normalized_not_rejected(fresh_db, monkeypatch):
+    """A single entry in upper-case hex is normalized to canonical
+    lower-case at load, not rejected: it still authenticates."""
+    import app.config as config
+    from app import identity
+    from app.main import app
+
+    monkeypatch.delenv("AI_FLEET_TENANT_API_KEYS")
+    upper = "sha256:" + hash_key("single-key-0123456789abcdef").split(":", 1)[1].upper()
+    monkeypatch.setattr(config, "API_KEY", upper)
+    assert identity.validate_key_config() == []
+    c = TestClient(app)
+    assert c.get("/tasks", headers={"X-API-Key": "single-key-0123456789abcdef"}).status_code == 200
 
 
 def test_cross_scheme_operator_key_reuse_refused(fresh_db, monkeypatch):

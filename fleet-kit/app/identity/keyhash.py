@@ -76,11 +76,14 @@ def find(presented: dict, entries) -> object:
     """Value of the configured entry that matches, or None.
 
     presented: presented_hashes(...) of the presented key.
-    entries: iterable of (stored_hash, value); stored_hash must be normalized.
+    entries: iterable of (stored_hash, value). A stored hash is normalized
+    (lower-case hex) before it is compared, so a single entry written with
+    upper-case hex still matches instead of sitting silently dead.
     Every entry is compared (no early exit), each in constant time.
     """
     found = _NO_MATCH
     for stored, value in entries:
+        stored = normalize(stored)
         candidate = presented.get(scheme_of(stored), "")
         ok = hmac.compare_digest(candidate.encode("ascii"), stored.encode("ascii"))
         if ok and found is _NO_MATCH:
