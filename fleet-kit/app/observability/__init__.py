@@ -159,8 +159,11 @@ def correlate_task(tenant_id: str, task_id: str) -> dict:
     (submitted -> to -> ...). The chain is followed by "from"/"to" rather
     than taken from the newest entry, because two overlapping requests may
     append their audit entries in the opposite order of their
-    compare-and-set writes. Caller must have checked that the task belongs
-    to tenant_id.
+    compare-and-set writes. An older-format entry (no "from") is taken to
+    leave the state the previous entry (by seq) moved to; when such entries
+    are present and the chain does not end at the newest entry, the newest
+    entry wins (the 7a44718 rule), so mixed history is not misreported.
+    Caller must have checked that the task belongs to tenant_id.
     """
     task = db.get_task(task_id)
     if task is None:
@@ -171,6 +174,8 @@ def correlate_task(tenant_id: str, task_id: str) -> dict:
     sends, receipts = {}, {}
     created = None  # detail of the first task.create entry
     last_status = None
+    prev_status = "submitted"  # state the previous task.status entry moved to
+    has_legacy_status = False
     moves = {}  # from -> to, one per state (CAS: a state is left at most once)
     for e in entries:
         d, action = e["detail"], e["action"]
@@ -182,9 +187,17 @@ def correlate_task(tenant_id: str, task_id: str) -> dict:
         elif action == "message.receipt":
             receipts.setdefault(d.get("message_id"), d)
         elif action == "task.status":
-            last_status = d.get("to", d.get("status"))
-            if d.get("from") is not None and last_status is not None:
-                moves.setdefault(d["from"], last_status)
+            to = d.get("to", d.get("status"))
+            if to is None:
+                continue
+            last_status = to
+            if d.get("from") is not None:
+                moves.setdefault(d["from"], to)
+            else:
+                # Older format (no "from"): it left the previous entry's state.
+                moves.setdefault(prev_status, to)
+                has_legacy_status = True
+            prev_status = to
 
     problems = []
     if not task.get("trace_id"):
@@ -194,14 +207,14 @@ def correlate_task(tenant_id: str, task_id: str) -> dict:
     elif created.get("trace_id") != task.get("trace_id"):
         # The trace was changed after creation, around the API.
         problems.append({"task_id": task_id, "missing": ["audit.task.trace_id_mismatch"]})
-    if moves:
-        expected, seen = "submitted", set()
-        while expected in moves and expected not in seen:
-            seen.add(expected)
-            expected = moves[expected]
-    else:
-        # Entries without "from" (older format): newest one wins.
-        expected = last_status or "submitted"
+    expected, seen = "submitted", set()
+    while expected in moves and expected not in seen:
+        seen.add(expected)
+        expected = moves[expected]
+    if has_legacy_status and expected != last_status:
+        # History has entries without "from" (older format), which the chain
+        # cannot order reliably: the newest entry wins, as in 7a44718.
+        expected = last_status
     if task["status"] != expected:
         problems.append({
             "task_id": task_id,

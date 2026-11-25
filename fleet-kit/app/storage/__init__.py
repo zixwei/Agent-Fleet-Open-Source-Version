@@ -284,8 +284,28 @@ def list_tasks(tenant_id=None):
 
 def insert_message(envelope):
     """Insert a message. Returns True if inserted, False if the
-    idempotency key already exists (duplicate delivery)."""
+    idempotency key already exists (duplicate delivery).
+
+    A row stored under the key's legacy (pre-encoding) form is the same
+    message: its key is moved to the encoded form in place (same row, same
+    message_id) and False is returned, so the caller fetches that row."""
+    from app.messaging import legacy_form_of_key
+
+    key = envelope["idempotency_key"]
+    legacy = legacy_form_of_key(key)
     with connect() as conn:
+        if legacy != key:
+            try:
+                cur = conn.execute(
+                    "UPDATE messages SET idempotency_key = ? WHERE idempotency_key = ?",
+                    (key, legacy),
+                )
+            except sqlite3.IntegrityError:
+                # Both forms exist; the row under the encoded key is the original.
+                return False
+            if cur.rowcount > 0:
+                conn.commit()
+                return False
         try:
             conn.execute(
                 "INSERT INTO messages (idempotency_key, message_id, event_id, task_id, tenant_id, sender_agent_id, recipient_agent_id, event_type, payload, created_at, context_id, correlation_id, trace_id, protocol, protocol_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -314,11 +334,21 @@ def insert_message(envelope):
 
 
 def get_message_by_key(idempotency_key):
+    """Exact key first, then its legacy (pre-encoding) form, so a row stored
+    before key components were percent-encoded is still found."""
+    from app.messaging import legacy_form_of_key
+
+    legacy = legacy_form_of_key(idempotency_key)
     with connect() as conn:
         row = conn.execute(
             "SELECT * FROM messages WHERE idempotency_key = ?",
             (idempotency_key,),
         ).fetchone()
+        if not row and legacy != idempotency_key:
+            row = conn.execute(
+                "SELECT * FROM messages WHERE idempotency_key = ?",
+                (legacy,),
+            ).fetchone()
     if not row:
         return None
     d = dict(row)

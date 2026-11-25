@@ -10,6 +10,8 @@ pins for the ones already fixed by earlier follow-ups:
 - deletion / rewrite of the trusted checkpoint row
 - task trace_id changed after creation
 - legacy agents migrated into the configured default tenant
+- retries of messages stored under the pre-encoding idempotency key
+- correlation over mixed old-format / new-format status history
 
 Run:  python -m pytest tests/test_review_followups.py -q
 """
@@ -18,6 +20,7 @@ import os
 import sqlite3
 import sys
 import threading
+import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -161,6 +164,56 @@ def test_idempotency_key_encoding_is_injective_and_backward_compatible():
     )
 
 
+def _legacy_message(tid, event_type, key):
+    """A message row as stored before key components were percent-encoded."""
+    from app.messaging import legacy_idempotency_key, now_iso
+
+    return {
+        "idempotency_key": legacy_idempotency_key("tenant-a", "orch", tid, event_type, key),
+        "message_id": str(uuid.uuid4()),
+        "event_id": str(uuid.uuid4()),
+        "task_id": tid,
+        "tenant_id": "tenant-a",
+        "sender_agent_id": "orch",
+        "recipient_agent_id": "worker",
+        "event_type": event_type,
+        "payload": {"e": event_type},
+        "created_at": now_iso(),
+    }
+
+
+def test_retry_of_legacy_idempotency_key_does_not_re_execute(client):
+    from app import storage as db
+    from app.messaging import idempotency_key
+
+    tid = _task(client)
+    old = _legacy_message(tid, "a:b", "k:1")
+    assert db.insert_message(old) is True
+    again = _send(client, tid, "a:b", "k:1")
+    assert again["stored"] is False, again
+    assert again["message"]["message_id"] == old["message_id"]
+    # Same row, now under the encoded key; no second row was written.
+    assert again["message"]["idempotency_key"] == idempotency_key("tenant-a", "orch", tid, "a:b", "k:1")
+    assert len(client.get(f"/tasks/{tid}/messages", headers=ADMIN).json()) == 1
+    once_more = _send(client, tid, "a:b", "k:1")
+    assert once_more["stored"] is False
+    assert once_more["message"]["message_id"] == old["message_id"]
+    assert len(client.get(f"/tasks/{tid}/messages", headers=ADMIN).json()) == 1
+
+
+def test_lookup_by_encoded_key_finds_legacy_row():
+    from app import storage as db
+    from app.messaging import idempotency_key, legacy_form_of_key
+
+    old = _legacy_message("task-legacy", "a:b", "k:1")
+    assert db.insert_message(old) is True
+    new_key = idempotency_key("tenant-a", "orch", "task-legacy", "a:b", "k:1")
+    assert new_key != old["idempotency_key"]
+    assert legacy_form_of_key(new_key) == old["idempotency_key"]
+    found = db.get_message_by_key(new_key)
+    assert found is not None and found["message_id"] == old["message_id"]
+
+
 # --- 3. audit window anchoring past 1,000 entries -----------------------------
 
 def test_audit_verify_endpoint_past_1000_entries(client, fresh_db):
@@ -282,6 +335,33 @@ def test_correlation_follows_chain_when_audits_land_out_of_order(client):
     audit.record("tenant-a", "task.status", tid, {"task_id": tid, "from": "submitted", "to": "working", "principal": principal})
     assert audit.correlate_task("tenant-a", tid)["ok"] is True
     storage.set_task_status_atomic(tid, "completed", "failed", now_iso())  # around the API
+    assert audit.correlate_task("tenant-a", tid)["ok"] is False
+
+
+def test_correlation_mixed_old_and_new_status_history(client):
+    from app import observability as audit
+    from app import storage
+    from app.messaging import now_iso
+
+    principal = {"kind": "tenant", "agent_id": None}
+    tid = _task(client)
+    assert storage.set_task_status_atomic(tid, "submitted", "working", now_iso())
+    assert storage.set_task_status_atomic(tid, "working", "completed", now_iso())
+    # Old format (no "from") first, then new format.
+    audit.record("tenant-a", "task.status", tid, {"task_id": tid, "status": "working"})
+    audit.record("tenant-a", "task.status", tid, {"task_id": tid, "from": "working", "to": "completed"})
+    assert audit.correlate_task("tenant-a", tid)["ok"] is True
+
+    # Reverse mix: new format first, then old format.
+    tid2 = _task(client)
+    assert storage.set_task_status_atomic(tid2, "submitted", "working", now_iso())
+    assert storage.set_task_status_atomic(tid2, "working", "completed", now_iso())
+    audit.record("tenant-a", "task.status", tid2, {"task_id": tid2, "from": "submitted", "to": "working"})
+    audit.record("tenant-a", "task.status", tid2, {"task_id": tid2, "status": "completed"})
+    assert audit.correlate_task("tenant-a", tid2)["ok"] is True
+
+    # Status changed around the API: still reported.
+    assert storage.set_task_status_atomic(tid, "completed", "failed", now_iso())
     assert audit.correlate_task("tenant-a", tid)["ok"] is False
 
 
