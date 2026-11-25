@@ -1,0 +1,507 @@
+"""Module 5 - Storage & Workspace (persistence).
+
+Thin SQLite layer. Every table write goes through here so the PostgreSQL
+adapter (planned, plan v0.2.6 §23) can replace this module without touching
+the other five modules. No ORM: plain SQL, one connection per call.
+"""
+import json
+import sqlite3
+from pathlib import Path
+
+from app import config
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    name TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    capabilities TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'Pending',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'submitted',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    created_by_agent_id TEXT,
+    trace_id TEXT
+);
+CREATE TABLE IF NOT EXISTS messages (
+    idempotency_key TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    sender_agent_id TEXT NOT NULL,
+    recipient_agent_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    context_id TEXT,
+    correlation_id TEXT,
+    trace_id TEXT,
+    protocol TEXT,
+    protocol_version TEXT
+);
+CREATE TABLE IF NOT EXISTS message_receipts (
+    message_id TEXT NOT NULL,
+    recipient_agent_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, recipient_agent_id)
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    prev_hash TEXT NOT NULL,
+    entry_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '{}'
+);
+-- Query-path indexes. Every column below exists in the oldest schema, so
+-- creating them on an existing database is safe; IF NOT EXISTS keeps
+-- init_db idempotent.
+-- GET /audit (actor = ? ORDER BY seq DESC LIMIT ?)
+CREATE INDEX IF NOT EXISTS idx_audit_actor_seq ON audit_log (actor, seq);
+-- correlate_task (actor = ? AND target = ? ORDER BY seq)
+CREATE INDEX IF NOT EXISTS idx_audit_actor_target_seq ON audit_log (actor, target, seq);
+-- list_messages (task_id = ? ORDER BY created_at), receipts by message_id
+CREATE INDEX IF NOT EXISTS idx_messages_task_created ON messages (task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages (message_id);
+-- GET /tasks (tenant_id = ? ORDER BY created_at)
+CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks (tenant_id, created_at);
+"""
+
+
+# Envelope fields persisted for T09 (audit record correlation). Fixed list,
+# so the column names interpolated into ALTER TABLE are never user input.
+MESSAGE_TRACE_COLUMNS = (
+    "context_id", "correlation_id", "trace_id", "protocol", "protocol_version",
+)
+
+
+def connect() -> sqlite3.Connection:
+    path = Path(config.DATABASE_PATH)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with connect() as conn:
+        conn.executescript(SCHEMA)
+        # Migrate older 6-column agents tables (no tenant_id).
+        cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(agents)").fetchall()
+        }
+        if "tenant_id" not in cols:
+            # Legacy rows belong to the tenant this deployment was running
+            # as (AI_FLEET_TENANT), which is also the tenant their tasks
+            # already carry; the literal 'default' would orphan them when
+            # AI_FLEET_TENANT is set to something else. Fail closed on a
+            # malformed tenant id instead of writing it into every row.
+            from app.identity import valid_tenant_id
+
+            tenant_id = config.DEFAULT_TENANT
+            if not valid_tenant_id(tenant_id):
+                raise RuntimeError(
+                    f"cannot migrate agents: AI_FLEET_TENANT {tenant_id!r} is not a valid tenant id"
+                )
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
+            )
+            # Every existing row is a legacy row at this point (the column
+            # was just added), so this touches nothing created later.
+            conn.execute("UPDATE agents SET tenant_id = ?", (tenant_id,))
+        # Migrate older tasks tables (no creator column). NULL = created
+        # with a tenant/admin credential.
+        task_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "created_by_agent_id" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN created_by_agent_id TEXT")
+        # T09: tasks carry the trace every message on them defaults to.
+        if "trace_id" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN trace_id TEXT")
+        # T09: persist the envelope's correlation fields (they used to be
+        # built and then dropped). Rows from before the migration keep
+        # NULL and are reported as unattributed, never back-filled.
+        msg_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        for col in MESSAGE_TRACE_COLUMNS:
+            if col not in msg_cols:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
+        conn.commit()
+
+
+def insert_agent(agent_id, tenant_id, name, endpoint, capabilities, status, created_at):
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO agents (agent_id, tenant_id, name, endpoint, capabilities, status, created_at) VALUES (?,?,?,?,?,?,?)",
+            (agent_id, tenant_id, name, endpoint, json.dumps(capabilities), status, created_at),
+        )
+        conn.commit()
+
+
+def get_agent(agent_id, tenant_id=None):
+    with connect() as conn:
+        if tenant_id is None:
+            row = conn.execute(
+                "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM agents WHERE agent_id = ? AND tenant_id = ?",
+                (agent_id, tenant_id),
+            ).fetchone()
+    return dict(row) if row else None
+
+
+def list_agents(tenant_id=None):
+    with connect() as conn:
+        if tenant_id is None:
+            rows = conn.execute("SELECT * FROM agents ORDER BY created_at").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM agents WHERE tenant_id = ? ORDER BY created_at",
+                (tenant_id,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_agent_status(agent_id, status, tenant_id=None):
+    with connect() as conn:
+        if tenant_id is None:
+            cur = conn.execute(
+                "UPDATE agents SET status = ? WHERE agent_id = ?", (status, agent_id)
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE agents SET status = ? WHERE agent_id = ? AND tenant_id = ?",
+                (status, agent_id, tenant_id),
+            )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def set_task_status_atomic(task_id, from_status, to_status, updated_at):
+    """CAS status update. Returns True if a row moved."""
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+            (to_status, updated_at, task_id, from_status),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def audit_head():
+    """(seq, entry_hash) of the newest audit entry; (0, "GENESIS") when empty."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+    return (row["seq"], row["entry_hash"]) if row else (0, "GENESIS")
+
+
+def get_audit_entry(seq):
+    """One audit entry by seq, or None (checkpoint check in verify_chain)."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM audit_log WHERE seq = ?", (seq,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["detail"] = json.loads(d["detail"])
+    return d
+
+
+def list_audit_from_seq(after_seq=0, limit=1000):
+    """Oldest-first batch of entries with seq > after_seq (chain verification)."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+            (after_seq, limit),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail"])
+        out.append(d)
+    return out
+
+
+def insert_task(
+    task_id, tenant_id, agent_id, title, status, created_at, updated_at,
+    created_by_agent_id=None, trace_id=None,
+):
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO tasks (task_id, tenant_id, agent_id, title, status, created_at, updated_at, created_by_agent_id, trace_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (task_id, tenant_id, agent_id, title, status, created_at, updated_at,
+             created_by_agent_id, trace_id),
+        )
+        conn.commit()
+
+
+def get_task(task_id):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_task_status(task_id, status, updated_at):
+    with connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+            (status, updated_at, task_id),
+        )
+        conn.commit()
+
+
+def list_tasks(tenant_id=None):
+    with connect() as conn:
+        if tenant_id:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE tenant_id = ? ORDER BY created_at",
+                (tenant_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM tasks ORDER BY created_at").fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_message(envelope):
+    """Insert a message. Returns True if inserted, False if the
+    idempotency key already exists (duplicate delivery).
+
+    A row stored under the key's legacy (pre-encoding) form is the same
+    message: its key is moved to the encoded form in place (same row, same
+    message_id) and False is returned, so the caller fetches that row."""
+    from app.messaging import legacy_form_of_key
+
+    key = envelope["idempotency_key"]
+    legacy = legacy_form_of_key(key)
+    with connect() as conn:
+        if legacy != key:
+            try:
+                cur = conn.execute(
+                    "UPDATE messages SET idempotency_key = ? WHERE idempotency_key = ?",
+                    (key, legacy),
+                )
+            except sqlite3.IntegrityError:
+                # Both forms exist; the row under the encoded key is the original.
+                return False
+            if cur.rowcount > 0:
+                conn.commit()
+                return False
+        try:
+            conn.execute(
+                "INSERT INTO messages (idempotency_key, message_id, event_id, task_id, tenant_id, sender_agent_id, recipient_agent_id, event_type, payload, created_at, context_id, correlation_id, trace_id, protocol, protocol_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    envelope["idempotency_key"],
+                    envelope["message_id"],
+                    envelope["event_id"],
+                    envelope["task_id"],
+                    envelope["tenant_id"],
+                    envelope["sender_agent_id"],
+                    envelope["recipient_agent_id"],
+                    envelope["event_type"],
+                    json.dumps(envelope["payload"]),
+                    envelope["created_at"],
+                    envelope.get("context_id"),
+                    envelope.get("correlation_id"),
+                    envelope.get("trace_id"),
+                    envelope.get("protocol"),
+                    envelope.get("protocol_version"),
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def get_message_by_key(idempotency_key):
+    """Exact key first, then its legacy (pre-encoding) form, so a row stored
+    before key components were percent-encoded is still found."""
+    from app.messaging import legacy_form_of_key
+
+    legacy = legacy_form_of_key(idempotency_key)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM messages WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if not row and legacy != idempotency_key:
+            row = conn.execute(
+                "SELECT * FROM messages WHERE idempotency_key = ?",
+                (legacy,),
+            ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["payload"] = json.loads(d["payload"])
+    return d
+
+
+def get_message_by_id(message_id):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM messages WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["payload"] = json.loads(d["payload"])
+    return d
+
+
+def record_receipt(message_id, recipient_agent_id, tenant_id, received_at):
+    """Record a delivery receipt. Returns True if recorded, False if this
+    recipient already receipted the message (duplicate receipt is a no-op,
+    same at-least-once rule as duplicate deliveries)."""
+    with connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO message_receipts VALUES (?,?,?,?)",
+                (message_id, recipient_agent_id, tenant_id, received_at),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def get_receipt(message_id):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM message_receipts WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_messages(task_id):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE task_id = ? ORDER BY created_at",
+            (task_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["payload"] = json.loads(d["payload"])
+        # Delivery receipt, if the recipient has confirmed receipt.
+        d["receipt"] = get_receipt(d["message_id"])
+        out.append(d)
+    return out
+
+
+def append_audit(prev_hash, entry_hash, created_at, actor, action, target, detail):
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO audit_log (prev_hash, entry_hash, created_at, actor, action, target, detail) VALUES (?,?,?,?,?,?,?)",
+            (prev_hash, entry_hash, created_at, actor, action, target, json.dumps(detail)),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def append_audit_transaction(build):
+    """Append one audit entry atomically.
+
+    build(prev_hash) returns the entry dict (entry_hash, created_at,
+    actor, action, target, detail). The read of the previous hash and
+    the insert run inside a single BEGIN IMMEDIATE transaction, so two
+    concurrent appends can never read the same prev_hash and fork the
+    chain (the race that broke verification under concurrent agent
+    processes). Returns (seq, prev_hash, entry).
+    """
+    path = Path(config.DATABASE_PATH)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.isolation_level = None  # manual transaction control
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        prev_hash = row["entry_hash"] if row else "GENESIS"
+        entry = build(prev_hash)
+        cur = conn.execute(
+            "INSERT INTO audit_log (prev_hash, entry_hash, created_at, actor, action, target, detail) VALUES (?,?,?,?,?,?,?)",
+            (
+                prev_hash,
+                entry["entry_hash"],
+                entry["created_at"],
+                entry["actor"],
+                entry["action"],
+                entry["target"],
+                json.dumps(entry["detail"]),
+            ),
+        )
+        seq = cur.lastrowid
+        conn.execute("COMMIT")
+        return seq, prev_hash, entry
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def last_audit_hash():
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+    return row["entry_hash"] if row else "GENESIS"
+
+
+def list_audit_for_target(actor, target):
+    """All audit entries of one tenant (actor) about one target, oldest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE actor = ? AND target = ? ORDER BY seq ASC",
+            (actor, target),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail"])
+        out.append(d)
+    return out
+
+
+def list_audit(limit=100, actor=None):
+    with connect() as conn:
+        if actor is not None:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE actor = ? ORDER BY seq DESC LIMIT ?",
+                (actor, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM audit_log ORDER BY seq DESC LIMIT ?", (limit,)
+            ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail"])
+        out.append(d)
+    return out
