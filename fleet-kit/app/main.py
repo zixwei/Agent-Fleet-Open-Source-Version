@@ -361,7 +361,21 @@ def send_message(task_id: str, body: MessageIn, auth=Depends(require_api_key)):
         raise HTTPException(
             status_code=400, detail=f"sender agent {body.sender_agent_id} not found"
         )
-    recipient_id = body.recipient_agent_id or task["agent_id"]
+    # T01 fix: when the caller omits the recipient and the sender is the
+    # task's agent, the reply goes back to the latest other-agent sender
+    # on this task, not to the sender itself. Otherwise the recipient
+    # still defaults to the task's agent (previous behaviour).
+    if body.recipient_agent_id:
+        recipient_id = body.recipient_agent_id
+    elif body.sender_agent_id == task["agent_id"]:
+        prior = sorted(bus.list_for_task(task_id), key=lambda m: m["created_at"])
+        recipient_id = next(
+            (m["sender_agent_id"] for m in reversed(prior)
+             if m["sender_agent_id"] != body.sender_agent_id),
+            task["agent_id"],
+        )
+    else:
+        recipient_id = task["agent_id"]
     if not registry.get_agent(recipient_id, tenant_id=auth["tenant_id"]):
         raise HTTPException(
             status_code=400, detail=f"recipient agent {recipient_id} not found"
